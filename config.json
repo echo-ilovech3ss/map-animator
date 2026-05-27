@@ -1,0 +1,28 @@
+{
+  "_comment": "Indian Railways Route Animation - Configuration",
+  "_info": "Add stations with lat/lon and optional hindi name. Define routes as arrays of station keys.",
+  
+  "stations": {
+    "Dhanbad":       { "lat": 23.7922, "lon": 86.4283, "hindi": "धनबाद" },
+    "Pradhankhunta": { "lat": 23.7724, "lon": 86.5170, "hindi": "प्रधानखूँटा" },
+    "Asansol":       { "lat": 23.6913, "lon": 86.9748, "hindi": "आसनसोल" },
+    "Jhajha":        { "lat": 24.7725, "lon": 86.3864, "hindi": "झाझा" },
+    "Kiul":          { "lat": 25.1719, "lon": 86.1083, "hindi": "किऊल" },
+    "Barauni":       { "lat": 25.4622, "lon": 85.9881, "hindi": "बरौनी" },
+    "Barh":          { "lat": 25.4834, "lon": 85.7093, "hindi": "बाढ" }
+  },
+  
+  "routes": {
+    "main":           ["Dhanbad", "Pradhankhunta", "Asansol", "Jhajha", "Kiul"],
+    "branch_barauni": ["Kiul", "Barauni"],
+    "branch_barh":    ["Kiul", "Barh"]
+  },
+  
+  "animation": {
+    "duration_seconds": 15,
+    "fps": 60,
+    "output_file": "output/indian_railways_animation.mp4",
+    "label_language": "english",
+    "show_station_labels": true
+  }
+}
