@@ -55,7 +55,10 @@ npm run tauri build
 * **Frontend**: React 18 + HTML5 Canvas (`src/App.jsx`, `src/utils/canvasRender.js`)
 * **Styling**: Vanilla CSS with elegant glassmorphism, dynamic transitions, and responsive macOS-Sonoma aesthetics (`src/index.css`)
 * **Backend**: Rust + Tauri v2 (`src-tauri/src/main.rs`, `src-tauri/capabilities/default.json` for filesystem ACL controls)
-* **Database**: Local railway and highway JSON coordinates (`public/data/`)
+* **Database & Snapping Caches**: 
+  - **Offline Snapping Caches**: The app includes fully pre-compiled JSON databases for the entire Indian railway and highway networks inside `public/data/` (so snapping operates 100% offline with zero external requests!).
+  - **Raw Geofabrik Dataset**: The raw 1.6GB OpenStreetMap dataset for India (`india-latest.osm.pbf`) used to build these snapping caches is ignored from Git tracking for speed and safety.
+  - **Download Link**: If you wish to rebuild the snapping databases from scratch, download the raw PBF file directly from the [Geofabrik India Download Page](https://download.geofabrik.de/asia/india.html) (or via [direct link](https://download.geofabrik.de/asia/india-latest.osm.pbf)) and save it in the root folder as `india-260529.osm.pbf`.
 
 ---
 
