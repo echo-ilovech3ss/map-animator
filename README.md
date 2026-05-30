@@ -1,4 +1,4 @@
-# Map Animator v2.0 🗺️🚂🚗
+# Map Animator v3.6 🗺️🚂🚗
 
 A high-fidelity, premium offline travel infographic desktop application built with **Tauri v2 + React + HTML5 Canvas**. 
 
@@ -8,26 +8,44 @@ A high-fidelity, premium offline travel infographic desktop application built wi
 
 ## 🎨 Key Features
 
-### 1. Articulated Train Physics (Slithering Locomotive)
+### 1. Cinematic Intro Transitions
+* **Marker-First Radial Spin (Frames 0 to 30)**: The starting station marker spins and fills clockwise from the right (angle 0) at the very beginning of the animation, while the vehicle remains hidden.
+* **Vehicle Appearance Phase (Frames 30 to 60)**: The starting marker is fully filled, and the vehicle appears (engine for train, or car) at the starting station dot while remaining stationary.
+* **Journey Starts (Frame 60+)**: The vehicle begins moving along the track. For the train mode, each coach emerges one by one behind the engine normally as it moves, creating a premium narrative opening.
+
+### 2. Configurable Station Halts
+* **Halt Customization**: Added a sleek **Station Stop Duration** slider under the Settings panel, allowing you to configure stops from `0.0s` up to `2.0s` (in `0.1s` steps, defaulting to `0.5s`).
+* **Halt Timing Mathematics**: Precomputes an exact frame-to-node mapping (`frameToNodeIdx`) at compilation. When the vehicle reaches any intermediate station, it remains stationary for exactly your configured halt duration.
+* **Travel Preservation**: Halts are capped at 50% of total video duration so that the vehicle is guaranteed travel time even with numerous stops.
+
+### 3. Pulsing Concentric Station Approach Ripples
+* **Concentric Radar Ripple**: As the vehicle approaches any intermediate or final station (within `40 nodes` of the coordinates), a gorgeous expanding circular outline pulses outward from the station dot and fades.
+* **Dynamic Wave Scaling**: Renders two overlapping expanding concentric waves that adapt to Y-axis coordinates and expand from the white rings, acting as a highly engaging "Approaching Station..." visual radar indicator.
+
+### 4. Double-Layer Esri Satellite Mapping
+* **Esri World Imagery**: Replaces the flat backdrops with high-resolution satellite tiles fetched directly from Esri.
+* **Overlaid Reference Labels**: Overlays a transparent World Boundaries and Places map layer above the track routes, keeping place names (like the **Ganga River** and town centers) legible regardless of the underlying land imagery colors.
+
+### 5. Articulated Train Physics (Slithering Locomotive)
 * **5-Segment Articulated Train**: A sleek top-down aerodynamic bullet locomotive followed by **4 passenger coaches**.
 * **Bending Couplings**: Powered by a custom **geodesic trailing path solver** (`getTrailingPoint`), all segments rotate independently and snake gracefully around track curves, bending realistically at couplings.
 * **Gradual Emergence**: Coaches slide smoothly out of the starting station point one-by-one as the train head advances, mimicking a real train pulling out of a terminal instead of popping out of thin air.
 
-### 2. Sizing Parity & Detail
+### 6. Sizing Parity & Detail
 * **Ferrari Red Sports Car**: For highway routes, draws a detailed sports car complete with headlights, windows, racing stripes, spoiler wings, and rubber tires.
 * **Perfect Proportional Scale**: The sports car is scaled to match the visual weight and bounding dimensions of the train coaches perfectly.
 
-### 3. Dynamic Timing-Compensation
+### 7. Dynamic Timing-Compensation
 * Implemented a self-correcting frame encoder timing loop. By tracking canvas render latency using `performance.now()`, the recorder dynamically trims `setTimeout` delays. 
 * This ensures that exported MP4 videos match the target duration (e.g. 14s) exactly to the millisecond instead of being stretched by rendering overhead.
 
-### 4. GIS Smart Label Cards
+### 8. GIS Smart Label Cards
 * Rather than drawing static labels that overlap vertical paths, the canvas engine calculates incoming/outgoing track angles and places station labels dynamically on the **outside of curves** with elegant dotted leader lines.
 
-### 5. Full Offline Snapping Router
+### 9. Full Offline Snapping Router
 * Snaps stops to railways or highways completely offline using integrated JSON indexes of the Indian GIS network, defaulting to online Overpass API downloads if needed.
 
-### 6. Persistent Local Storage
+### 10. Persistent Local Storage
 * Saves and restores active stops, timed settings, theme choices, custom stop labels, and default macOS export directories (`Downloads/` resolved natively) automatically across launches.
 
 ---

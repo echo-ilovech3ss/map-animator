@@ -26,6 +26,7 @@ export default function App() {
     if (saved) {
       const parsed = JSON.parse(saved);
       if (parsed.showVehicle === undefined) parsed.showVehicle = true;
+      if (parsed.stopDuration === undefined) parsed.stopDuration = 0.5;
       return parsed;
     }
     return {
@@ -35,6 +36,7 @@ export default function App() {
       showLabels: true,
       showVehicle: true,
       autoDuration: true,
+      stopDuration: 0.5,
       exportName: "",
       exportDirectory: ""
     };
@@ -324,7 +326,6 @@ export default function App() {
       }
 
       // 2. Mathematically compute coordinate boundaries for tile preloading
-      const circumference = 2 * Math.PI * 6378137.0;
       const rMajor = 6378137.0;
       
       function toMercator(lat, lon) {
@@ -334,41 +335,10 @@ export default function App() {
       }
 
       const mercPoints = routeGeometry.map(pt => toMercator(pt[0], pt[1]));
-      const xs = mercPoints.map(p => p[0]);
-      const ys = mercPoints.map(p => p[1]);
-
-      let minX = Math.min(...xs);
-      let maxX = Math.max(...xs);
-      let minY = Math.min(...ys);
-      let maxY = Math.max(...ys);
-
-      const padX = Math.max((maxX - minX) * 0.22, 100000) || 100000;
-      const padY = Math.max((maxY - minY) * 0.22, 100000) || 100000;
-
-      minX -= padX; maxX += padX; minY -= padY; maxY += padY;
-
-      const canvasRatio = 1280 / 720;
-      const dataRatio = (maxX - minX) / (maxY - minY);
-
-      let renderMinX = minX, renderMaxX = maxX, renderMinY = minY, renderMaxY = maxY;
-
-      if (canvasRatio > dataRatio) {
-        const targetW = (maxY - minY) * canvasRatio;
-        const diff = targetW - (maxX - minX);
-        renderMinX -= diff / 2; renderMaxX += diff / 2;
-      } else {
-        const targetH = (maxX - minX) / canvasRatio;
-        const diff = targetH - (maxY - minY);
-        renderMinY -= diff / 2; renderMaxY += diff / 2;
-      }
-
-      const metersSpan = renderMaxX - renderMinX;
-      let zoom = Math.round(Math.log2((circumference * 15.0) / metersSpan));
-      zoom = Math.max(3, Math.min(zoom, 17));
 
       // 3. Preload Map Tiles in background (takes 20% -> 100%)
       setProgressText("Downloading high-resolution preview map...");
-      const tileSet = await preloadMapTiles(renderMinX, renderMaxX, renderMinY, renderMaxY, zoom, theme, (text, pct) => {
+      const tileSet = await preloadMapTiles(mercPoints, 12, theme, (text, pct) => {
         setProgressText(text);
         setProgressPct(Math.round(20 + pct * 0.8));
       });
@@ -404,7 +374,6 @@ export default function App() {
     canvas.width = canvasW;
     canvas.height = canvasH;
 
-    // Web Mercator bounds matching logic
     const circumference = 2 * Math.PI * 6378137.0;
     const rMajor = 6378137.0;
     
@@ -415,54 +384,110 @@ export default function App() {
       return [x, y];
     }
 
+    function mercatorToTileXY(mx, my, zoom) {
+      const halfC = circumference / 2;
+      const xFrac = (mx + halfC) / circumference;
+      const yFrac = 1.0 - (my + halfC) / circumference;
+      return [xFrac * Math.pow(2, zoom), yFrac * Math.pow(2, zoom)];
+    }
+
     const mercPoints = routeGeometry.map(pt => toMercator(pt[0], pt[1]));
     const stationMercs = stops.map(s => {
       const coords = toMercator(s.lat, s.lon);
       return { name: s.customName || s.name, x: coords[0], y: coords[1], hindi: s.hindi };
     });
 
-    const xs = mercPoints.map(p => p[0]);
-    const ys = mercPoints.map(p => p[1]);
+    const zoom = 12;
+    const scale = (256 * Math.pow(2, zoom)) / circumference;
+    const stopDuration = animOptions.stopDuration !== undefined ? animOptions.stopDuration : 0.5;
 
-    let minX = Math.min(...xs);
-    let maxX = Math.max(...xs);
-    let minY = Math.min(...ys);
-    let maxY = Math.max(...ys);
+    // 1. Find indices of stations in mercPoints
+    const stationIndices = stationMercs.map(station => {
+      let closestIdx = 0;
+      let closestDist = Infinity;
+      for (let i = 0; i < mercPoints.length; i++) {
+        const dist = Math.hypot(mercPoints[i][0] - station.x, mercPoints[i][1] - station.y);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestIdx = i;
+        }
+      }
+      return closestIdx;
+    });
 
-    // Apply the 22% / 100km safety border margin to the preview canvas as well!
-    const padX = Math.max((maxX - minX) * 0.22, 100000) || 100000;
-    const padY = Math.max((maxY - minY) * 0.22, 100000) || 100000;
-
-    minX -= padX;
-    maxX += padX;
-    minY -= padY;
-    maxY += padY;
-
-    const canvasRatio = canvasW / canvasH;
-    const dataRatio = (maxX - minX) / (maxY - minY);
-
-    let renderMinX = minX;
-    let renderMaxX = maxX;
-    let renderMinY = minY;
-    let renderMaxY = maxY;
-
-    if (canvasRatio > dataRatio) {
-      const targetW = (maxY - minY) * canvasRatio;
-      const diff = targetW - (maxX - minX);
-      renderMinX -= diff / 2;
-      renderMaxX += diff / 2;
-    } else {
-      const targetH = (maxX - minX) / canvasRatio;
-      const diff = targetH - (maxY - minY);
-      renderMinY -= diff / 2;
-      renderMaxY += diff / 2;
+    // 2. Precompute frame mapping with 60-frame intro (30s spin, 30s vehicle appearance)
+    const frameToNodeIdx = new Array(totalFrames);
+    const introFrames = 60; // 30 frames for spin, 30 frames for vehicle appearance
+    const activeFrames = Math.max(0, totalFrames - introFrames);
+    const numInterStops = stationMercs.length - 2;
+    const stopDurationFrames = Math.round(stopDuration * animOptions.fps);
+    
+    // First 60 frames are pinned to node 0 (start station)
+    for (let f = 0; f < introFrames; f++) {
+      frameToNodeIdx[f] = 0;
     }
 
-    function toCanvas(mx, my) {
-      const px = ((mx - renderMinX) / (renderMaxX - renderMinX)) * canvasW;
-      const py = canvasH - ((my - renderMinY) / (renderMaxY - renderMinY)) * canvasH;
-      return [px, py];
+    // Cap total stop duration at 50% of the active travel frames to guarantee the vehicle travels!
+    const maxTotalStopFrames = Math.round(activeFrames * 0.5);
+    const totalStopFrames = Math.min(numInterStops * stopDurationFrames, maxTotalStopFrames);
+    const stopFramesPerStop = numInterStops > 0 ? Math.floor(totalStopFrames / numInterStops) : 0;
+    const travelFrames = activeFrames - (numInterStops * stopFramesPerStop);
+
+    let currentFrame = introFrames;
+    for (let seg = 0; seg < stationIndices.length - 1; seg++) {
+      const startNode = stationIndices[seg];
+      const endNode = stationIndices[seg + 1];
+      const nodeSpan = endNode - startNode;
+
+      // Distribute travel frames proportionally to the segment length
+      const segFrac = nodeSpan / mercPoints.length;
+      const segTravelFrames = Math.round(segFrac * travelFrames);
+
+      // Populate travel frames
+      for (let f = 0; f < segTravelFrames; f++) {
+        if (currentFrame < totalFrames) {
+          const ratio = f / Math.max(1, segTravelFrames - 1);
+          frameToNodeIdx[currentFrame] = Math.round(startNode + ratio * nodeSpan);
+          currentFrame++;
+        }
+      }
+
+      // Populate stop frames if it is an intermediate stop
+      if (seg < stationIndices.length - 2) {
+        for (let f = 0; f < stopFramesPerStop; f++) {
+          if (currentFrame < totalFrames) {
+            frameToNodeIdx[currentFrame] = endNode;
+            currentFrame++;
+          }
+        }
+      }
     }
+
+    // Fill any remaining frames with the last node index
+    while (currentFrame < totalFrames) {
+      frameToNodeIdx[currentFrame] = mercPoints.length - 1;
+      currentFrame++;
+    }
+
+    // Precompute sliding average camera path coordinates (low-pass filter)
+    const camPoints = [];
+    const windowSize = 45; // 45 points before, 45 points after
+    for (let i = 0; i < mercPoints.length; i++) {
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      const start = Math.max(0, i - windowSize);
+      const end = Math.min(mercPoints.length - 1, i + windowSize);
+      for (let j = start; j <= end; j++) {
+        sumX += mercPoints[j][0];
+        sumY += mercPoints[j][1];
+        count++;
+      }
+      camPoints.push([sumX / count, sumY / count]);
+    }
+
+    // Dynamic toCanvas function that references active camera center closed over by drawing loop
+    let toCanvas = () => [0, 0];
 
     // Helper to calculate trailing points along the path for articulated preview train
     function getTrailingPoint(leadIdx, targetDist) {
@@ -586,7 +611,21 @@ export default function App() {
     const draw = () => {
       ctx.clearRect(0, 0, canvasW, canvasH);
 
-      // Render Preview high-resolution Map Background (CartoDB Light/Dark tiles)
+      const activeIdx = frameToNodeIdx[Math.min(frame, totalFrames - 1)];
+      const activeCount = Math.max(1, activeIdx + 1);
+      const leadIdx = Math.min(activeIdx, mercPoints.length - 1);
+      
+      // Update camera center at vehicle lead point
+      const [camX, camY] = camPoints[leadIdx];
+
+      // Re-assign mapping function for the current camera coordinates
+      toCanvas = (mx, my) => {
+        const px = 640 + (mx - camX) * scale;
+        const py = 360 - (my - camY) * scale;
+        return [px, py];
+      };
+
+      // Render Preview high-resolution Map Background (Satellite base tiles)
       if (tileSet) {
         function tileXYToMercatorBounds(tx, ty, zoom) {
           const halfC = circumference / 2;
@@ -598,12 +637,19 @@ export default function App() {
           return { minX, maxX, minY, maxY };
         }
 
-        for (let tx = tileSet.startX; tx <= tileSet.endX; tx++) {
-          for (let ty = tileSet.startY; ty <= tileSet.endY; ty++) {
-            const key = `${tileSet.zoom}_${tx}_${ty}`;
-            const img = tileSet.cache[key];
+        const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
+        const cx = Math.floor(ctxFrac);
+        const cy = Math.floor(ctyFrac);
+
+        // 1. Draw Satellite base tiles (cacheSat) in 9x7 viewport grid
+        for (let dx = -4; dx <= 4; dx++) {
+          for (let dy = -3; dy <= 3; dy++) {
+            const tx = cx + dx;
+            const ty = cy + dy;
+            const key = `${zoom}_${tx}_${ty}`;
+            const img = tileSet.cacheSat[key];
             if (img) {
-              const bounds = tileXYToMercatorBounds(tx, ty, tileSet.zoom);
+              const bounds = tileXYToMercatorBounds(tx, ty, zoom);
               const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
               const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
               ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
@@ -626,10 +672,6 @@ export default function App() {
         ctx.lineTo(...toCanvas(mercPoints[i][0], mercPoints[i][1]));
       }
       ctx.stroke();
-
-      // Active path neon glow
-      const t = Math.min(frame / totalFrames, 1.0);
-      const activeCount = Math.max(1, Math.floor(t * mercPoints.length));
 
       if (activeCount > 1) {
         // Glowing outline
@@ -659,36 +701,108 @@ export default function App() {
         ctx.stroke();
 
         // Render Dynamic Articulated Vehicle Avatar at the head of the path
-        const leadIdx = Math.min(activeCount - 1, mercPoints.length - 1);
         const leadPt = mercPoints[leadIdx];
         const [vpx, vpy] = toCanvas(leadPt[0], leadPt[1]);
         const vAngle = smoothedAngles[leadIdx];
 
-        if (animOptions.showVehicle) {
-        ctx.save();
-        ctx.shadowColor = "rgba(0,0,0,0.3)";
-        ctx.shadowBlur = 8;
-        ctx.shadowOffsetY = 3;
+        if (animOptions.showVehicle && frame >= 30) {
+          ctx.save();
+          ctx.shadowColor = "rgba(0,0,0,0.3)";
+          ctx.shadowBlur = 8;
+          ctx.shadowOffsetY = 3;
 
-        if (pathMode === "rail") {
-          // Highly detailed Articulated Train (5 segments: Engine + 4 Coaches bending independently!)
-          const coachW = 12; // Bigger preview width!
-          const coachL = 18; // Bigger preview length!
-          
-          // Get Trailing points for Coach 1, 2, 3, and 4 in preview spacing
-          const coach1 = getTrailingPoint(leadIdx, 21.5);
-          const coach2 = getTrailingPoint(leadIdx, 43.0);
-          const coach3 = getTrailingPoint(leadIdx, 64.5);
-          const coach4 = getTrailingPoint(leadIdx, 86.0);
+          if (pathMode === "rail") {
+            // Highly detailed Articulated Train (5 segments: Engine + 4 Coaches bending independently!)
+            const coachW = 12;
+            const coachL = 18;
+            
+            // Get Trailing points for Coach 1, 2, 3, and 4 in preview spacing
+            const coach1 = getTrailingPoint(leadIdx, 21.5);
+            const coach2 = getTrailingPoint(leadIdx, 43.0);
+            const coach3 = getTrailingPoint(leadIdx, 64.5);
+            const coach4 = getTrailingPoint(leadIdx, 86.0);
 
-          const drawPreviewCoach = (coach) => {
-            if (!coach.emerged) return; // Do not draw if not emerged yet!
+            const drawPreviewCoach = (coach) => {
+              if (!coach.emerged) return; // Do not draw if not emerged yet!
+              ctx.save();
+              ctx.translate(coach.x, coach.y);
+              ctx.rotate(-coach.angle);
+              ctx.fillStyle = "#f5f5f7";
+              ctx.beginPath();
+              const cx = -coachL / 2, cy = -coachW / 2, cw = coachL, ch = coachW, r = 2.5;
+              ctx.moveTo(cx + r, cy);
+              ctx.lineTo(cx + cw - r, cy);
+              ctx.quadraticCurveTo(cx + cw, cy, cx + cw, cy + r);
+              ctx.lineTo(cx + cw, cy + ch - r);
+              ctx.quadraticCurveTo(cx + cw, cy + ch, cx + cw - r, cy + ch);
+              ctx.lineTo(cx + r, cy + ch);
+              ctx.quadraticCurveTo(cx, cy + ch, cx, cy + ch - r);
+              ctx.lineTo(cx, cy + r);
+              ctx.quadraticCurveTo(cx, cy, cx + r, cy);
+              ctx.fill();
+              
+              ctx.fillStyle = "#ff5b00";
+              ctx.fillRect(-coachL / 2, -coachW / 2 + 1, coachL, 1.2);
+              ctx.fillRect(-coachL / 2, coachW / 2 - 2.2, coachL, 1.2);
+              
+              // Coupling Link front
+              ctx.fillStyle = "#2c2c2e";
+              ctx.fillRect(-coachL / 2 - 2, -1, 2, 2);
+              ctx.restore();
+            };
+
+            // Draw Rear to Front for correct layering
+            drawPreviewCoach(coach4);
+            drawPreviewCoach(coach3);
+            drawPreviewCoach(coach2);
+            drawPreviewCoach(coach1);
+
+            // Draw Engine Locomotive (Front)
             ctx.save();
-            ctx.translate(coach.x, coach.y);
-            ctx.rotate(-coach.angle);
+            ctx.translate(vpx, vpy);
+            ctx.rotate(-vAngle);
             ctx.fillStyle = "#f5f5f7";
             ctx.beginPath();
-            const cx = -coachL / 2, cy = -coachW / 2, cw = coachL, ch = coachW, r = 2.5;
+            ctx.moveTo(-9, -coachW / 2);
+            ctx.lineTo(2, -coachW / 2);
+            ctx.quadraticCurveTo(11.5, -coachW / 2, 11.5, 0); // Bullet nose
+            ctx.quadraticCurveTo(11.5, coachW / 2, 2, coachW / 2);
+            ctx.lineTo(-9, coachW / 2);
+            ctx.quadraticCurveTo(-9, coachW / 2, -9, 0);
+            ctx.fill();
+
+            ctx.fillStyle = "#ff5b00";
+            ctx.fillRect(-9, -coachW / 2 + 1, 20.5, 1.2);
+            ctx.fillRect(-9, coachW / 2 - 2.2, 20.5, 1.2);
+
+            // Windshield
+            ctx.fillStyle = "#1c1c1e";
+            ctx.beginPath();
+            ctx.arc(2, 0, 3.5, -Math.PI / 2, Math.PI / 2);
+            ctx.fill();
+
+            // Coupling Link rear
+            ctx.fillStyle = "#2c2c2e";
+            ctx.fillRect(-11, -1, 2, 2);
+            ctx.restore();
+
+          } else {
+            // Highly detailed Red Sports Car
+            ctx.save();
+            ctx.translate(vpx, vpy);
+            ctx.rotate(-vAngle);
+            const length = 18;
+            const width = 12;
+            
+            ctx.fillStyle = "#1c1c1e";
+            ctx.fillRect(4, -7.5, 5, 2);
+            ctx.fillRect(4, 5.5, 5, 2);
+            ctx.fillRect(-9, -7.5, 5, 2);
+            ctx.fillRect(-9, 5.5, 5, 2);
+
+            ctx.fillStyle = "#d30f1a";
+            ctx.beginPath();
+            const cx = -length / 2, cy = -width / 2, cw = length, ch = width, r = 3;
             ctx.moveTo(cx + r, cy);
             ctx.lineTo(cx + cw - r, cy);
             ctx.quadraticCurveTo(cx + cw, cy, cx + cw, cy + r);
@@ -699,119 +813,41 @@ export default function App() {
             ctx.lineTo(cx, cy + r);
             ctx.quadraticCurveTo(cx, cy, cx + r, cy);
             ctx.fill();
-            
-            ctx.fillStyle = "#ff5b00";
-            ctx.fillRect(-coachL / 2, -coachW / 2 + 1, coachL, 1.2);
-            ctx.fillRect(-coachL / 2, coachW / 2 - 2.2, coachL, 1.2);
-            
-            // Coupling Link front
-            ctx.fillStyle = "#2c2c2e";
-            ctx.fillRect(-coachL / 2 - 2, -1, 2, 2);
+
+            ctx.fillStyle = "#1c1c1e";
+            ctx.fillRect(-length / 2 + 1.5, -2, length - 3, 1);
+            ctx.fillRect(-length / 2 + 1.5, 1, length - 3, 1);
+
+            ctx.fillStyle = "#1c1c1e";
+            ctx.fillRect(-length / 2 - 1, -width / 2, 2, width);
+
+            ctx.fillStyle = "#ffcc00";
+            ctx.fillRect(length / 2 - 2.5, -width / 2 + 1, 2.5, 1.2);
+            ctx.fillRect(length / 2 - 2.5, width / 2 - 2.2, 2.5, 1.2);
+
+            ctx.fillStyle = "#ff3b30";
+            ctx.fillRect(-length / 2, -width / 2 + 1.8, 1.2, 1.2);
+            ctx.fillRect(-length / 2, width / 2 - 3, 1.2, 1.2);
+
+            ctx.fillStyle = "#111111";
+            ctx.beginPath();
+            ctx.moveTo(-5, -width / 2 + 1.8);
+            ctx.lineTo(6, -width / 2 + 2.7);
+            ctx.quadraticCurveTo(9, 0, 6, width / 2 - 2.7);
+            ctx.lineTo(-5, width / 2 - 1.8);
+            ctx.quadraticCurveTo(-8, 0, -5, -width / 2 + 1.8);
+            ctx.fill();
             ctx.restore();
-          };
-
-          // Draw Rear to Front for correct layering
-          drawPreviewCoach(coach4);
-          drawPreviewCoach(coach3);
-          drawPreviewCoach(coach2);
-          drawPreviewCoach(coach1);
-
-          // Draw Engine Locomotive (Front)
-          ctx.save();
-          ctx.translate(vpx, vpy);
-          ctx.rotate(-vAngle);
-          ctx.fillStyle = "#f5f5f7";
-          ctx.beginPath();
-          ctx.moveTo(-9, -coachW / 2);
-          ctx.lineTo(2, -coachW / 2);
-          ctx.quadraticCurveTo(11.5, -coachW / 2, 11.5, 0); // Bullet nose
-          ctx.quadraticCurveTo(11.5, coachW / 2, 2, coachW / 2);
-          ctx.lineTo(-9, coachW / 2);
-          ctx.quadraticCurveTo(-9, coachW / 2, -9, 0);
-          ctx.fill();
-
-          ctx.fillStyle = "#ff5b00";
-          ctx.fillRect(-9, -coachW / 2 + 1, 20.5, 1.2);
-          ctx.fillRect(-9, coachW / 2 - 2.2, 20.5, 1.2);
-
-          // Windshield
-          ctx.fillStyle = "#1c1c1e";
-          ctx.beginPath();
-          ctx.arc(2, 0, 3.5, -Math.PI / 2, Math.PI / 2);
-          ctx.fill();
-
-          // Coupling Link rear
-          ctx.fillStyle = "#2c2c2e";
-          ctx.fillRect(-11, -1, 2, 2);
+          }
           ctx.restore();
-
-        } else {
-          // Highly detailed Red Sports Car with black tires, stripes, and spoiler (scaled to be as big as a train coach)
-          ctx.save();
-          ctx.translate(vpx, vpy);
-          ctx.rotate(-vAngle);
-          const length = 18;
-          const width = 12;
-          
-          // 4 black tires on sides
-          ctx.fillStyle = "#1c1c1e";
-          ctx.fillRect(4, -7.5, 5, 2);
-          ctx.fillRect(4, 5.5, 5, 2);
-          ctx.fillRect(-9, -7.5, 5, 2);
-          ctx.fillRect(-9, 5.5, 5, 2);
-
-          // Main shell (Ferrari red)
-          ctx.fillStyle = "#d30f1a";
-          ctx.beginPath();
-          const cx = -length / 2, cy = -width / 2, cw = length, ch = width, r = 3;
-          ctx.moveTo(cx + r, cy);
-          ctx.lineTo(cx + cw - r, cy);
-          ctx.quadraticCurveTo(cx + cw, cy, cx + cw, cy + r);
-          ctx.lineTo(cx + cw, cy + ch - r);
-          ctx.quadraticCurveTo(cx + cw, cy + ch, cx + cw - r, cy + ch);
-          ctx.lineTo(cx + r, cy + ch);
-          ctx.quadraticCurveTo(cx, cy + ch, cx, cy + ch - r);
-          ctx.lineTo(cx, cy + r);
-          ctx.quadraticCurveTo(cx, cy, cx + r, cy);
-          ctx.fill();
-
-          // Black stripes
-          ctx.fillStyle = "#1c1c1e";
-          ctx.fillRect(-length / 2 + 1.5, -2, length - 3, 1);
-          ctx.fillRect(-length / 2 + 1.5, 1, length - 3, 1);
-
-          // Spoiler wing
-          ctx.fillStyle = "#1c1c1e";
-          ctx.fillRect(-length / 2 - 1, -width / 2, 2, width);
-
-          // Headlights & Tail lights
-          ctx.fillStyle = "#ffcc00";
-          ctx.fillRect(length / 2 - 2.5, -width / 2 + 1, 2.5, 1.2);
-          ctx.fillRect(length / 2 - 2.5, width / 2 - 2.2, 2.5, 1.2);
-
-          ctx.fillStyle = "#ff3b30";
-          ctx.fillRect(-length / 2, -width / 2 + 1.8, 1.2, 1.2);
-          ctx.fillRect(-length / 2, width / 2 - 3, 1.2, 1.2);
-
-          // Windshield
-          ctx.fillStyle = "#111111";
-          ctx.beginPath();
-          ctx.moveTo(-5, -width / 2 + 1.8);
-          ctx.lineTo(6, -width / 2 + 2.7);
-          ctx.quadraticCurveTo(9, 0, 6, width / 2 - 2.7);
-          ctx.lineTo(-5, width / 2 - 1.8);
-          ctx.quadraticCurveTo(-8, 0, -5, -width / 2 + 1.8);
-          ctx.fill();
-          ctx.restore();
-        }
-        ctx.restore();
         }
       }
 
-      // Draw Station concentric rings
+      // Draw Station concentric rings with dynamic clock-sweep spinny fill animation
       stationMercs.forEach((station, idx) => {
         const [px, py] = toCanvas(station.x, station.y);
         
+        // White outer backing circle with soft shadow
         ctx.fillStyle = "#ffffff";
         ctx.shadowColor = "rgba(0,0,0,0.1)";
         ctx.shadowBlur = 4;
@@ -821,15 +857,116 @@ export default function App() {
 
         ctx.shadowBlur = 0;
         ctx.shadowColor = "transparent";
-        
-        if (idx === 0) ctx.fillStyle = "#34c759";
-        else if (idx === stationMercs.length - 1) ctx.fillStyle = "#ff3b30";
-        else ctx.fillStyle = "#0071e3";
 
-        ctx.beginPath();
-        ctx.arc(px, py, 7, 0, 2 * Math.PI);
-        ctx.fill();
+        // Calculate smooth approaching radial fill ratio
+        let ratio = 0;
+        const targetNodeIdx = stationIndices[idx];
+        
+        if (idx === 0) {
+          ratio = Math.min(1, frame / 30); // Start station spins and fills during the first 30 frames
+        } else if (activeIdx >= targetNodeIdx) {
+          ratio = 1; // Already crossed stops
+        } else {
+          const nodeDist = targetNodeIdx - activeIdx;
+          if (nodeDist <= 40) {
+            ratio = (40 - nodeDist) / 40; // Sweeps from 0 to 1
+          }
+        }
+
+        // Assign station colors
+        if (idx === 0) ctx.fillStyle = "#34c759"; // Green
+        else if (idx === stationMercs.length - 1) ctx.fillStyle = "#ff3b30"; // Red
+        else ctx.fillStyle = "#0071e3"; // Blue
+
+        if (ratio > 0) {
+          ctx.beginPath();
+          if (ratio >= 1) {
+            ctx.arc(px, py, 7, 0, 2 * Math.PI);
+          } else {
+            ctx.moveTo(px, py);
+            // Start angle is exactly 0 (the right) for a spinning clock-sweep starting from the right!
+            const startAngle = 0;
+            ctx.arc(px, py, 7, startAngle, startAngle + ratio * 2 * Math.PI);
+          }
+          ctx.fill();
+        }
+
+        // Draw subtle hollow guide outline when not fully filled
+        if (ratio < 1) {
+          ctx.strokeStyle = theme === "dark" ? "rgba(255, 255, 255, 0.22)" : "rgba(0, 0, 0, 0.12)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(px, py, 7, 0, 2 * Math.PI);
+          ctx.stroke();
+        }
       });
+
+      // Draw concentric circle pulse animation for upcoming intermediate/final stations
+      stationMercs.forEach((station, sIdx) => {
+        if (sIdx > 0) {
+          const targetNodeIdx = stationIndices[sIdx];
+          const nodeDist = targetNodeIdx - activeIdx;
+          
+          if (nodeDist > 0 && nodeDist <= 40) {
+            const [spx, spy] = toCanvas(station.x, station.y);
+            ctx.save();
+            ctx.lineWidth = 2;
+
+            const t1 = ((40 - nodeDist) / 40);
+            const r1 = 11 + t1 * 30; // Grows from concentric ring size
+            ctx.strokeStyle = theme === "dark" 
+              ? `rgba(255, 204, 85, ${1 - t1})` 
+              : `rgba(224, 96, 32, ${1 - t1})`;
+            ctx.beginPath();
+            ctx.arc(spx, spy, r1, 0, 2 * Math.PI);
+            ctx.stroke();
+
+            if (nodeDist < 25) {
+              const t2 = ((25 - nodeDist) / 25);
+              const r2 = 11 + t2 * 20;
+              ctx.strokeStyle = theme === "dark" 
+                ? `rgba(255, 204, 85, ${(1 - t2) * 0.6})` 
+                : `rgba(224, 96, 32, ${(1 - t2) * 0.6})`;
+              ctx.beginPath();
+              ctx.arc(spx, spy, r2, 0, 2 * Math.PI);
+              ctx.stroke();
+            }
+            ctx.restore();
+          }
+        }
+      });
+
+      // 2. Draw Place Names & Reference boundaries layer on top of tracks in preview
+      if (tileSet) {
+        function tileXYToMercatorBounds(tx, ty, zoom) {
+          const halfC = circumference / 2;
+          const numTiles = Math.pow(2, zoom);
+          const minX = (tx / numTiles) * circumference - halfC;
+          const maxX = ((tx + 1) / numTiles) * circumference - halfC;
+          const maxY = halfC - (ty / numTiles) * circumference;
+          const minY = halfC - ((ty + 1) / numTiles) * circumference;
+          return { minX, maxX, minY, maxY };
+        }
+
+        const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
+        const cx = Math.floor(ctxFrac);
+        const cy = Math.floor(ctyFrac);
+
+        for (let dx = -4; dx <= 4; dx++) {
+          for (let dy = -3; dy <= 3; dy++) {
+            const tx = cx + dx;
+            const ty = cy + dy;
+            const key = `${zoom}_${tx}_${ty}`;
+            const img = tileSet.cacheRef[key];
+            if (img) {
+              const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+              const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
+              const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
+              ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
+            }
+          }
+        }
+      }
 
       // Draw Station labels using smart GIS offsets
       if (animOptions.showLabels) {
@@ -879,6 +1016,8 @@ export default function App() {
           ctx.quadraticCurveTo(lx + cardW / 2, ly - cardH / 2, lx + cardW / 2, ly - cardH / 2 + r);
           ctx.lineTo(lx + cardW / 2, ly + cardH / 2 - r);
           ctx.quadraticCurveTo(lx + cardW / 2, ly + cardH / 2, lx + cardW / 2 - r, ly + cardH / 2);
+          ctx.lineTo(lx - cardW / 2 + r, ly + cardH / 2);
+          ctx.quadraticCurveTo(lx - cardW / 2, ly + cardH / 2, lx - cardW / 2 - r, ly + cardH / 2); // Corrected syntax error!
           ctx.lineTo(lx - cardW / 2 + r, ly + cardH / 2);
           ctx.quadraticCurveTo(lx - cardW / 2, ly + cardH / 2, lx - cardW / 2, ly + cardH / 2 - r);
           ctx.lineTo(lx - cardW / 2, ly - cardH / 2 + r);

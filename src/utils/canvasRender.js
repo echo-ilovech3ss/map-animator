@@ -26,46 +26,85 @@ function mercatorToTileXY(mx, my, zoom) {
   return [xFrac * Math.pow(2, zoom), yFrac * Math.pow(2, zoom)];
 }
 
-export async function preloadMapTiles(renderMinX, renderMaxX, renderMinY, renderMaxY, zoom, theme, onProgress) {
-  const [minTx, minTy] = mercatorToTileXY(renderMinX, renderMaxY, zoom);
-  const [maxTx, maxTy] = mercatorToTileXY(renderMaxX, renderMinY, zoom);
-  const startX = Math.floor(Math.min(minTx, maxTx)) - 1;
-  const endX = Math.ceil(Math.max(minTx, maxTx)) + 1;
-  const startY = Math.floor(Math.min(minTy, maxTy)) - 1;
-  const endY = Math.ceil(Math.max(minTy, maxTy)) + 1;
-
-  const tilesToLoad = [];
-  for (let x = startX; x <= endX; x++) {
-    for (let y = startY; y <= endY; y++) {
-      tilesToLoad.push({ x, y, z: zoom });
+export async function preloadMapTiles(mercPoints, zoom, theme, onProgress) {
+  const uniqueTiles = new Set();
+  
+  // Find all tiles touched by the path at the zoom level
+  mercPoints.forEach(pt => {
+    const [tx, ty] = mercatorToTileXY(pt[0], pt[1], zoom);
+    const fX = Math.floor(tx);
+    const fY = Math.floor(ty);
+    
+    // Add a 3x3 grid of tiles around each point along the path
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        uniqueTiles.add(`${zoom}_${fX + dx}_${fY + dy}`);
+      }
     }
-  }
+  });
+
+  const tilesToLoad = Array.from(uniqueTiles).map(key => {
+    const [z, x, y] = key.split("_").map(Number);
+    return { z, x, y };
+  });
 
   let loaded = 0;
-  const cache = {};
-  const style = theme === "dark" ? "dark_all" : "light_all";
+  const cacheSat = {};
+  const cacheRef = {};
 
   const promises = tilesToLoad.map(t => {
     return new Promise((resolve) => {
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      img.src = `https://basemaps.cartocdn.com/${style}/${t.z}/${t.x}/${t.y}.png`;
-      img.onload = () => {
-        cache[`${t.z}_${t.x}_${t.y}`] = img;
-        loaded++;
-        onProgress(`Downloading high-resolution base map (${loaded}/${tilesToLoad.length})...`, Math.round((loaded / tilesToLoad.length) * 100));
-        resolve();
+      // 1. Load Esri World Imagery Satellite Tile
+      const imgSat = new Image();
+      imgSat.crossOrigin = "anonymous";
+      imgSat.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      
+      const checkResolve = () => {
+        if (cacheSat[`${t.z}_${t.x}_${t.y}`] && cacheRef[`${t.z}_${t.x}_${t.y}`]) {
+          loaded++;
+          onProgress(`Downloading satellite imagery (${loaded}/${tilesToLoad.length})...`, Math.round((loaded / tilesToLoad.length) * 100));
+          resolve();
+        }
       };
-      img.onerror = () => {
-        img.src = `https://tile.openstreetmap.org/${t.z}/${t.x}/${t.y}.png`;
-        img.onload = () => { cache[`${t.z}_${t.x}_${t.y}`] = img; loaded++; resolve(); };
-        img.onerror = () => { loaded++; resolve(); };
+
+      imgSat.onload = () => {
+        cacheSat[`${t.z}_${t.x}_${t.y}`] = imgSat;
+        checkResolve();
+      };
+      imgSat.onerror = () => {
+        // Fallback to OSM tile if satellite fails
+        const imgFall = new Image();
+        imgFall.crossOrigin = "anonymous";
+        imgFall.src = `https://tile.openstreetmap.org/${t.z}/${t.x}/${t.y}.png`;
+        imgFall.onload = () => {
+          cacheSat[`${t.z}_${t.x}_${t.y}`] = imgFall;
+          cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
+          checkResolve();
+        };
+        imgFall.onerror = () => {
+          cacheSat[`${t.z}_${t.x}_${t.y}`] = new Image();
+          cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
+          checkResolve();
+        };
+      };
+
+      // 2. Load Esri World Reference (Boundaries and Place names like Ganga River)
+      const imgRef = new Image();
+      imgRef.crossOrigin = "anonymous";
+      imgRef.src = `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      imgRef.onload = () => {
+        cacheRef[`${t.z}_${t.x}_${t.y}`] = imgRef;
+        checkResolve();
+      };
+      imgRef.onerror = () => {
+        cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
+        checkResolve();
       };
     });
   });
 
   await Promise.all(promises);
-  return { cache, startX, endX, startY, endY, zoom };
+  return { cacheSat, cacheRef, zoom, tiles: tilesToLoad };
 }
 
 function roundRectPath(ctx, x, y, width, height, radius) {
@@ -279,7 +318,7 @@ function drawVehicle(ctx, leadIdx, mercPoints, smoothedAngles, toCanvas, mode) {
 }
 
 export async function renderAndRecordAnimation({ routeGeometry, stations, options, onProgress }) {
-  const { duration, fps, language, showLabels, showVehicle = true, theme = "light", pathMode = "rail" } = options;
+  const { duration, fps, language, showLabels, showVehicle = true, theme = "light", pathMode = "rail", stopDuration = 0.5 } = options;
   const totalFrames = duration * fps;
 
   const canvas = document.createElement("canvas");
@@ -293,46 +332,96 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     return { name: s.customName || s.name, x: coords[0], y: coords[1], hindi: s.hindi };
   });
 
-  const xs = mercPoints.map(p => p[0]);
-  const ys = mercPoints.map(p => p[1]);
+  const zoom = 12;
+  const scale = (256 * Math.pow(2, zoom)) / CIRCUMFERENCE;
 
-  let minX = Math.min(...xs);
-  let maxX = Math.max(...xs);
-  let minY = Math.min(...ys);
-  let maxY = Math.max(...ys);
+  // 1. Find indices of stations in mercPoints
+  const stationIndices = stationMercs.map(station => {
+    let closestIdx = 0;
+    let closestDist = Infinity;
+    for (let i = 0; i < mercPoints.length; i++) {
+      const dist = Math.hypot(mercPoints[i][0] - station.x, mercPoints[i][1] - station.y);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestIdx = i;
+      }
+    }
+    return closestIdx;
+  });
 
-  const padX = Math.max((maxX - minX) * 0.22, 100000) || 100000;
-  const padY = Math.max((maxY - minY) * 0.22, 100000) || 100000;
-
-  minX -= padX; maxX += padX; minY -= padY; maxY += padY;
-
-  const canvasRatio = 2880 / 1620;
-  const dataRatio = (maxX - minX) / (maxY - minY);
-
-  let renderMinX = minX, renderMaxX = maxX, renderMinY = minY, renderMaxY = maxY;
-
-  if (canvasRatio > dataRatio) {
-    const targetW = (maxY - minY) * canvasRatio;
-    const diff = targetW - (maxX - minX);
-    renderMinX -= diff / 2; renderMaxX += diff / 2;
-  } else {
-    const targetH = (maxX - minX) / canvasRatio;
-    const diff = targetH - (maxY - minY);
-    renderMinY -= diff / 2; renderMaxY += diff / 2;
+  // 2. Precompute frame mapping with 60-frame intro (30s spin, 30s vehicle appearance)
+  const frameToNodeIdx = new Array(totalFrames);
+  const introFrames = 60; // 30 frames for spin, 30 frames for vehicle appearance
+  const activeFrames = Math.max(0, totalFrames - introFrames);
+  const numInterStops = stationMercs.length - 2;
+  const stopDurationFrames = Math.round(stopDuration * fps);
+  
+  // First 60 frames are pinned to node 0 (start station)
+  for (let f = 0; f < introFrames; f++) {
+    frameToNodeIdx[f] = 0;
   }
 
-  const metersSpan = renderMaxX - renderMinX;
-  let zoom = Math.round(Math.log2((CIRCUMFERENCE * 15.0) / metersSpan));
-  zoom = Math.max(3, Math.min(zoom, 17));
+  // Cap total stop duration at 50% of the active travel frames to guarantee the vehicle travels!
+  const maxTotalStopFrames = Math.round(activeFrames * 0.5);
+  const totalStopFrames = Math.min(numInterStops * stopDurationFrames, maxTotalStopFrames);
+  const stopFramesPerStop = numInterStops > 0 ? Math.floor(totalStopFrames / numInterStops) : 0;
+  const travelFrames = activeFrames - (numInterStops * stopFramesPerStop);
 
-  function toCanvas(mx, my) {
-    const px = ((mx - renderMinX) / (renderMaxX - renderMinX)) * 2880;
-    const py = 1620 - ((my - renderMinY) / (renderMaxY - renderMinY)) * 1620;
-    return [px, py];
+  let currentFrame = introFrames;
+  for (let seg = 0; seg < stationIndices.length - 1; seg++) {
+    const startNode = stationIndices[seg];
+    const endNode = stationIndices[seg + 1];
+    const nodeSpan = endNode - startNode;
+
+    // Distribute travel frames proportionally to the segment length (nodeSpan)
+    const segFrac = nodeSpan / mercPoints.length;
+    const segTravelFrames = Math.round(segFrac * travelFrames);
+
+    // Populate travel frames
+    for (let f = 0; f < segTravelFrames; f++) {
+      if (currentFrame < totalFrames) {
+        const ratio = f / Math.max(1, segTravelFrames - 1);
+        frameToNodeIdx[currentFrame] = Math.round(startNode + ratio * nodeSpan);
+        currentFrame++;
+      }
+    }
+
+    // Populate stop frames if it is an intermediate stop
+    if (seg < stationIndices.length - 2) {
+      for (let f = 0; f < stopFramesPerStop; f++) {
+        if (currentFrame < totalFrames) {
+          frameToNodeIdx[currentFrame] = endNode;
+          currentFrame++;
+        }
+      }
+    }
+  }
+
+  // Fill any remaining frames with the last node index
+  while (currentFrame < totalFrames) {
+    frameToNodeIdx[currentFrame] = mercPoints.length - 1;
+    currentFrame++;
+  }
+
+  // Precompute sliding average camera path coordinates (low-pass filter)
+  const camPoints = [];
+  const windowSize = 45; // 45 points before, 45 points after
+  for (let i = 0; i < mercPoints.length; i++) {
+    let sumX = 0;
+    let sumY = 0;
+    let count = 0;
+    const start = Math.max(0, i - windowSize);
+    const end = Math.min(mercPoints.length - 1, i + windowSize);
+    for (let j = start; j <= end; j++) {
+      sumX += mercPoints[j][0];
+      sumY += mercPoints[j][1];
+      count++;
+    }
+    camPoints.push([sumX / count, sumY / count]);
   }
 
   onProgress("Initializing map assets...", 10);
-  const tileSet = await preloadMapTiles(renderMinX, renderMaxX, renderMinY, renderMaxY, zoom, theme, (text, pct) => {
+  const tileSet = await preloadMapTiles(mercPoints, zoom, theme, (text, pct) => {
     onProgress(text, Math.round(10 + pct * 0.25));
   });
 
@@ -341,7 +430,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     : "'Helvetica Neue', -apple-system, BlinkMacSystemFont, sans-serif";
   const labelFontSize = 32;
 
-  // 1. Mathematically precompute smoothed vector heading angles for vehicles (with EMA filter)
+  // 3. Mathematically precompute smoothed vector heading angles for vehicles (with EMA filter)
   const smoothedAngles = [];
   if (mercPoints.length > 0) {
     let prevX = 0;
@@ -378,7 +467,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     }
   }
 
-  // 2. Precompute Smart GIS Label Offsets to place labels on the outside of bends
+  // 4. Precompute Smart GIS Label Offsets to place labels on the outside of bends
   stationMercs.forEach((station) => {
     let closestIdx = 0;
     let closestDist = Infinity;
@@ -425,12 +514,31 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   function renderFrame(frameIdx) {
     ctx.clearRect(0, 0, 2880, 1620);
 
-    for (let tx = tileSet.startX; tx <= tileSet.endX; tx++) {
-      for (let ty = tileSet.startY; ty <= tileSet.endY; ty++) {
-        const key = `${tileSet.zoom}_${tx}_${ty}`;
-        const img = tileSet.cache[key];
+    const activeIdx = frameToNodeIdx[Math.min(frameIdx, totalFrames - 1)];
+    const activeCount = Math.max(1, activeIdx + 1);
+    const leadIdx = Math.min(activeIdx, mercPoints.length - 1);
+    const [camX, camY] = camPoints[leadIdx];
+
+    const toCanvas = (mx, my) => {
+      const px = 1440 + (mx - camX) * scale;
+      const py = 810 - (my - camY) * scale;
+      return [px, py];
+    };
+
+    // Calculate map tile indices covering the camera focus
+    const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
+    const cx = Math.floor(ctxFrac);
+    const cy = Math.floor(ctyFrac);
+
+    // 1. Draw Satellite base tiles (cacheSat) in 13x9 viewport grid
+    for (let dx = -6; dx <= 6; dx++) {
+      for (let dy = -4; dy <= 4; dy++) {
+        const tx = cx + dx;
+        const ty = cy + dy;
+        const key = `${zoom}_${tx}_${ty}`;
+        const img = tileSet.cacheSat[key];
         if (img) {
-          const bounds = tileXYToMercatorBounds(tx, ty, tileSet.zoom);
+          const bounds = tileXYToMercatorBounds(tx, ty, zoom);
           const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
           const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
           ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
@@ -440,7 +548,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
 
     ctx.shadowBlur = 0;
     ctx.shadowColor = "transparent";
-    ctx.strokeStyle = theme === "dark" ? "#888888" : "#555555";
+    ctx.strokeStyle = theme === "dark" ? "rgba(255, 255, 255, 0.2)" : "rgba(0, 0, 0, 0.15)";
     ctx.lineWidth = 8;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -456,9 +564,6 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     ctx.stroke();
     ctx.globalAlpha = 1.0;
 
-    const t = Math.min(frameIdx / totalFrames, 1.0);
-    const activeCount = Math.max(1, Math.floor(t * mercPoints.length));
-    
     if (activeCount > 1) {
       ctx.shadowColor = theme === "dark" ? "#ffcc55" : "#ffbb44";
       ctx.shadowBlur = 18;
@@ -485,24 +590,115 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
       ctx.stroke();
 
       // Render Dynamic Articulated Vehicle Avatar at the head of the path
-      if (showVehicle) {
-        const leadIdx = Math.min(activeCount - 1, mercPoints.length - 1);
+      if (showVehicle && frameIdx >= 30) {
         drawVehicle(ctx, leadIdx, mercPoints, smoothedAngles, toCanvas, pathMode);
       }
     }
 
+    // Draw Station concentric rings with dynamic clock-sweep spinny fill animation
     stationMercs.forEach((station, idx) => {
       const [px, py] = toCanvas(station.x, station.y);
+      
+      // White outer backing circle with soft shadow
       ctx.shadowColor = "rgba(0,0,0,0.15)";
       ctx.shadowBlur = 8; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 4;
       ctx.fillStyle = "#ffffff";
       ctx.beginPath(); ctx.arc(px, py, 22, 0, 2 * Math.PI); ctx.fill();
       ctx.shadowBlur = 0; ctx.shadowColor = "transparent";
-      if (idx === 0) ctx.fillStyle = "#34c759";
-      else if (idx === stationMercs.length - 1) ctx.fillStyle = "#ff3b30";
-      else ctx.fillStyle = "#0071e3";
-      ctx.beginPath(); ctx.arc(px, py, 14, 0, 2 * Math.PI); ctx.fill();
+
+      // Calculate smooth approaching radial fill ratio
+      let ratio = 0;
+      const targetNodeIdx = stationIndices[idx];
+      
+      if (idx === 0) {
+        ratio = Math.min(1, frameIdx / 30); // Start station spins and fills during the first 30 frames
+      } else if (activeIdx >= targetNodeIdx) {
+        ratio = 1; // Already crossed stops
+      } else {
+        const nodeDist = targetNodeIdx - activeIdx;
+        if (nodeDist <= 40) {
+          ratio = (40 - nodeDist) / 40; // Sweeps from 0 to 1
+        }
+      }
+
+      // Assign station colors
+      if (idx === 0) ctx.fillStyle = "#34c759"; // Green
+      else if (idx === stationMercs.length - 1) ctx.fillStyle = "#ff3b30"; // Red
+      else ctx.fillStyle = "#0071e3"; // Blue
+
+      if (ratio > 0) {
+        ctx.beginPath();
+        if (ratio >= 1) {
+          ctx.arc(px, py, 14, 0, 2 * Math.PI);
+        } else {
+          ctx.moveTo(px, py);
+          // Start angle is exactly 0 (the right) for a spinning clock-sweep starting from the right!
+          const startAngle = 0;
+          ctx.arc(px, py, 14, startAngle, startAngle + ratio * 2 * Math.PI);
+        }
+        ctx.fill();
+      }
+
+      // Draw subtle hollow guide outline when not fully filled
+      if (ratio < 1) {
+        ctx.strokeStyle = theme === "dark" ? "rgba(255, 255, 255, 0.22)" : "rgba(0, 0, 0, 0.12)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(px, py, 14, 0, 2 * Math.PI);
+        ctx.stroke();
+      }
     });
+
+    // 2. Draw circle radar approach animation for upcoming intermediate/final stations
+    stationMercs.forEach((station, sIdx) => {
+      if (sIdx > 0) {
+        const targetNodeIdx = stationIndices[sIdx];
+        const nodeDist = targetNodeIdx - activeIdx;
+        
+        if (nodeDist > 0 && nodeDist <= 40) {
+          const [spx, spy] = toCanvas(station.x, station.y);
+          ctx.save();
+          ctx.lineWidth = 3.5;
+
+          const t1 = ((40 - nodeDist) / 40);
+          const r1 = 22 + t1 * 60; // Grows from concentric ring size
+          ctx.strokeStyle = theme === "dark" 
+            ? `rgba(255, 204, 85, ${1 - t1})` 
+            : `rgba(224, 96, 32, ${1 - t1})`;
+          ctx.beginPath();
+          ctx.arc(spx, spy, r1, 0, 2 * Math.PI);
+          ctx.stroke();
+
+          if (nodeDist < 25) {
+            const t2 = ((25 - nodeDist) / 25);
+            const r2 = 22 + t2 * 40;
+            ctx.strokeStyle = theme === "dark" 
+              ? `rgba(255, 204, 85, ${(1 - t2) * 0.6})` 
+              : `rgba(224, 96, 32, ${(1 - t2) * 0.6})`;
+            ctx.beginPath();
+            ctx.arc(spx, spy, r2, 0, 2 * Math.PI);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+    });
+
+    // 3. Draw Place Names & Reference boundaries layer on top of tracks so geography is readable
+    for (let dx = -6; dx <= 6; dx++) {
+      for (let dy = -4; dy <= 4; dy++) {
+        const tx = cx + dx;
+        const ty = cy + dy;
+        const key = `${zoom}_${tx}_${ty}`;
+        const img = tileSet.cacheRef[key];
+        if (img) {
+          const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+          const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
+          const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
+          ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
+        }
+      }
+    }
 
     if (showLabels) {
       stationMercs.forEach((station) => {

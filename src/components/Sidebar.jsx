@@ -307,6 +307,24 @@ export default function Sidebar({
               </div>
             </div>
 
+            <div className="input-group">
+              <span className="input-label">Station Stop Duration</span>
+              <div className="macos-slider-container">
+                <input
+                  type="range"
+                  className="macos-slider"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={animOptions.stopDuration !== undefined ? animOptions.stopDuration : 0.5}
+                  onChange={(e) => onChangeOptions("stopDuration", parseFloat(e.target.value))}
+                />
+                <span className="slider-val">
+                  {(animOptions.stopDuration !== undefined ? animOptions.stopDuration : 0.5).toFixed(1)}s
+                </span>
+              </div>
+            </div>
+
             {/* SECTION 7: TIMING & FORMATTING OPTIONS */}
             <div className="input-group">
               <span className="input-label">Timing & Formatting Options</span>
