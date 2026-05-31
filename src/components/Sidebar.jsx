@@ -274,6 +274,19 @@ export default function Sidebar({
               </div>
             </div>
 
+            {/* SECTION 4.5: MAP STYLE */}
+            <div className="input-group">
+              <span className="input-label">Map Style</span>
+              <div className="macos-segmented">
+                <button className={`segmented-btn ${animOptions.mapStyle === "satellite" ? "active" : ""}`} onClick={() => onChangeOptions("mapStyle", "satellite")}>
+                  Satellite
+                </button>
+                <button className={`segmented-btn ${animOptions.mapStyle === "political" ? "active" : ""}`} onClick={() => onChangeOptions("mapStyle", "political")}>
+                  Political
+                </button>
+              </div>
+            </div>
+
             {/* SECTION 5: DISPLAY LANGUAGE */}
             <div className="input-group">
               <span className="input-label">Display Language</span>

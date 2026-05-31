@@ -1,12 +1,13 @@
 import React, { useEffect, useRef } from "react";
 import L from "leaflet";
 
-export default function MapContainer({ stops, onAddStop, theme, routePath }) {
+export default function MapContainer({ stops, onAddStop, theme, routePath, mapStyle }) {
   const mapContainerRef = useRef(null);
   const mapInstanceRef = useRef(null);
   const markersGroupRef = useRef([]);
   const polylineRef = useRef(null);
   const tileLayerRef = useRef(null);
+  const refTileLayerRef = useRef(null);
 
   // Initialize Map
   useEffect(() => {
@@ -22,15 +23,6 @@ export default function MapContainer({ stops, onAddStop, theme, routePath }) {
 
     // Custom Zoom controls at bottom right
     L.control.zoom({ position: "bottomright" }).addTo(map);
-
-    // CartoDB Tile layer (light or dark mode)
-    const tileUrl = theme === "dark"
-      ? "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-      : "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
-
-    tileLayerRef.current = L.tileLayer(tileUrl, {
-      maxZoom: 19
-    }).addTo(map);
 
     // Map Click Listener to add location
     map.on("click", async (e) => {
@@ -73,21 +65,54 @@ export default function MapContainer({ stops, onAddStop, theme, routePath }) {
     };
   }, []);
 
-  // Toggle Light/Dark Map tiles dynamically
+  // Toggle Map Style and Light/Dark Map tiles dynamically
   useEffect(() => {
     const map = mapInstanceRef.current;
-    if (!map || !tileLayerRef.current) return;
+    if (!map) return;
 
-    map.removeLayer(tileLayerRef.current);
+    // Remove previous base and reference layers
+    if (tileLayerRef.current) {
+      map.removeLayer(tileLayerRef.current);
+      tileLayerRef.current = null;
+    }
+    if (refTileLayerRef.current) {
+      map.removeLayer(refTileLayerRef.current);
+      refTileLayerRef.current = null;
+    }
 
-    const tileUrl = theme === "dark"
-      ? "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-      : "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
+    if (mapStyle === "satellite") {
+      // 1. Add Satellite base layer
+      const satUrl = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+      tileLayerRef.current = L.tileLayer(satUrl, {
+        maxZoom: 19,
+        attribution: "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
+      }).addTo(map);
+    } else {
+      // 1. Add Political base layer (nolabels to avoid clashes)
+      const tileUrl = theme === "dark"
+        ? "https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png"
+        : "https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png";
 
-    tileLayerRef.current = L.tileLayer(tileUrl, {
+      tileLayerRef.current = L.tileLayer(tileUrl, {
+        maxZoom: 19,
+        attribution: "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors &copy; <a href=\"https://carto.com/attributions\">CARTO</a>"
+      }).addTo(map);
+    }
+
+    // 2. ALWAYS add Boundaries and Places reference overlay for dense labels
+    let refUrl;
+    if (mapStyle === "satellite") {
+      refUrl = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}";
+    } else {
+      refUrl = theme === "dark"
+        ? "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}"
+        : "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}";
+    }
+
+    refTileLayerRef.current = L.tileLayer(refUrl, {
       maxZoom: 19
     }).addTo(map);
-  }, [theme]);
+  }, [theme, mapStyle]);
 
   // Update Markers & Polyline when Stops change
   useEffect(() => {

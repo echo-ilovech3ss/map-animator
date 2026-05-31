@@ -26,7 +26,16 @@ function mercatorToTileXY(mx, my, zoom) {
   return [xFrac * Math.pow(2, zoom), yFrac * Math.pow(2, zoom)];
 }
 
-export async function preloadMapTiles(mercPoints, zoom, theme, onProgress) {
+export async function preloadMapTiles(mercPoints, zoom, theme, mapStyle = "satellite", onProgress) {
+  // If third argument is a function, then the caller used the old signature: (mercPoints, zoom, theme, onProgress)
+  // Let's handle backward compatibility robustly!
+  let actualMapStyle = mapStyle;
+  let actualOnProgress = onProgress;
+  if (typeof mapStyle === "function") {
+    actualOnProgress = mapStyle;
+    actualMapStyle = "satellite";
+  }
+
   const uniqueTiles = new Set();
   
   // Find all tiles touched by the path at the zoom level
@@ -54,50 +63,73 @@ export async function preloadMapTiles(mercPoints, zoom, theme, onProgress) {
 
   const promises = tilesToLoad.map(t => {
     return new Promise((resolve) => {
-      // 1. Load Esri World Imagery Satellite Tile
       const imgSat = new Image();
       imgSat.crossOrigin = "anonymous";
-      imgSat.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${t.z}/${t.y}/${t.x}`;
       
       const checkResolve = () => {
         if (cacheSat[`${t.z}_${t.x}_${t.y}`] && cacheRef[`${t.z}_${t.x}_${t.y}`]) {
           loaded++;
-          onProgress(`Downloading satellite imagery (${loaded}/${tilesToLoad.length})...`, Math.round((loaded / tilesToLoad.length) * 100));
+          const mapTypeName = actualMapStyle === "satellite" ? "satellite imagery" : "political map";
+          if (actualOnProgress) {
+            actualOnProgress(`Downloading ${mapTypeName} (${loaded}/${tilesToLoad.length})...`, Math.round((loaded / tilesToLoad.length) * 100));
+          }
           resolve();
         }
       };
+
+      // 1. Load Base Tile (Satellite or Political nolabels)
+      if (actualMapStyle === "satellite") {
+        imgSat.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      } else {
+        imgSat.src = theme === "dark"
+          ? `https://basemaps.cartocdn.com/dark_nolabels/${t.z}/${t.x}/${t.y}.png`
+          : `https://basemaps.cartocdn.com/light_nolabels/${t.z}/${t.x}/${t.y}.png`;
+      }
 
       imgSat.onload = () => {
         cacheSat[`${t.z}_${t.x}_${t.y}`] = imgSat;
         checkResolve();
       };
+      
       imgSat.onerror = () => {
-        // Fallback to OSM tile if satellite fails
+        // Fallback to OSM tile if base fails
         const imgFall = new Image();
         imgFall.crossOrigin = "anonymous";
         imgFall.src = `https://tile.openstreetmap.org/${t.z}/${t.x}/${t.y}.png`;
         imgFall.onload = () => {
           cacheSat[`${t.z}_${t.x}_${t.y}`] = imgFall;
-          cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
           checkResolve();
         };
         imgFall.onerror = () => {
           cacheSat[`${t.z}_${t.x}_${t.y}`] = new Image();
-          cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
           checkResolve();
         };
       };
 
-      // 2. Load Esri World Reference (Boundaries and Place names like Ganga River)
+      // 2. ALWAYS Load Esri World Reference (Boundaries and Place names) for dense labels
+      let refUrl;
+      if (actualMapStyle === "satellite") {
+        refUrl = `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      } else {
+        refUrl = theme === "dark"
+          ? `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/${t.z}/${t.y}/${t.x}`
+          : `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      }
+
       const imgRef = new Image();
       imgRef.crossOrigin = "anonymous";
-      imgRef.src = `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/${t.z}/${t.y}/${t.x}`;
+      imgRef.src = refUrl;
+      
       imgRef.onload = () => {
         cacheRef[`${t.z}_${t.x}_${t.y}`] = imgRef;
         checkResolve();
       };
+      
       imgRef.onerror = () => {
-        cacheRef[`${t.z}_${t.x}_${t.y}`] = new Image();
+        // Transparent fallback if reference layer fails
+        const imgBlank = new Image();
+        imgBlank.src = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+        cacheRef[`${t.z}_${t.x}_${t.y}`] = imgBlank;
         checkResolve();
       };
     });
@@ -318,7 +350,7 @@ function drawVehicle(ctx, leadIdx, mercPoints, smoothedAngles, toCanvas, mode) {
 }
 
 export async function renderAndRecordAnimation({ routeGeometry, stations, options, onProgress }) {
-  const { duration, fps, language, showLabels, showVehicle = true, theme = "light", pathMode = "rail", stopDuration = 0.5 } = options;
+  const { duration, fps, language, showLabels, showVehicle = true, theme = "light", pathMode = "rail", stopDuration = 0.5, mapStyle = "satellite" } = options;
   const totalFrames = duration * fps;
 
   const canvas = document.createElement("canvas");
@@ -421,7 +453,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   }
 
   onProgress("Initializing map assets...", 10);
-  const tileSet = await preloadMapTiles(mercPoints, zoom, theme, (text, pct) => {
+  const tileSet = await preloadMapTiles(mercPoints, zoom, theme, mapStyle, (text, pct) => {
     onProgress(text, Math.round(10 + pct * 0.25));
   });
 
@@ -514,6 +546,10 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   function renderFrame(frameIdx) {
     ctx.clearRect(0, 0, 2880, 1620);
 
+    // Fill background color based on theme and style to avoid visible flickers
+    ctx.fillStyle = theme === "dark" ? "#151516" : (mapStyle === "satellite" ? "#2b3d28" : "#f4f3f0");
+    ctx.fillRect(0, 0, 2880, 1620);
+
     const activeIdx = frameToNodeIdx[Math.min(frameIdx, totalFrames - 1)];
     const activeCount = Math.max(1, activeIdx + 1);
     const leadIdx = Math.min(activeIdx, mercPoints.length - 1);
@@ -530,7 +566,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     const cx = Math.floor(ctxFrac);
     const cy = Math.floor(ctyFrac);
 
-    // 1. Draw Satellite base tiles (cacheSat) in 13x9 viewport grid
+    // 1. Draw base tiles in 13x9 viewport grid
     for (let dx = -6; dx <= 6; dx++) {
       for (let dy = -4; dy <= 4; dy++) {
         const tx = cx + dx;

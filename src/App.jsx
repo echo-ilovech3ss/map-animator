@@ -27,6 +27,7 @@ export default function App() {
       const parsed = JSON.parse(saved);
       if (parsed.showVehicle === undefined) parsed.showVehicle = true;
       if (parsed.stopDuration === undefined) parsed.stopDuration = 0.5;
+      if (parsed.mapStyle === undefined) parsed.mapStyle = "satellite";
       return parsed;
     }
     return {
@@ -37,6 +38,7 @@ export default function App() {
       showVehicle: true,
       autoDuration: true,
       stopDuration: 0.5,
+      mapStyle: "satellite",
       exportName: "",
       exportDirectory: ""
     };
@@ -338,7 +340,7 @@ export default function App() {
 
       // 3. Preload Map Tiles in background (takes 20% -> 100%)
       setProgressText("Downloading high-resolution preview map...");
-      const tileSet = await preloadMapTiles(mercPoints, 12, theme, (text, pct) => {
+      const tileSet = await preloadMapTiles(mercPoints, 12, theme, animOptions.mapStyle || "satellite", (text, pct) => {
         setProgressText(text);
         setProgressPct(Math.round(20 + pct * 0.8));
       });
@@ -641,7 +643,11 @@ export default function App() {
         const cx = Math.floor(ctxFrac);
         const cy = Math.floor(ctyFrac);
 
-        // 1. Draw Satellite base tiles (cacheSat) in 9x7 viewport grid
+        // Draw solid background color fallback to avoid visual glitches
+        ctx.fillStyle = theme === "dark" ? "#151516" : (animOptions.mapStyle === "satellite" ? "#2b3d28" : "#f4f3f0");
+        ctx.fillRect(0, 0, canvasW, canvasH);
+
+        // 1. Draw base tiles in 9x7 viewport grid
         for (let dx = -4; dx <= 4; dx++) {
           for (let dy = -3; dy <= 3; dy++) {
             const tx = cx + dx;
@@ -1076,6 +1082,7 @@ export default function App() {
         onAddStop={handleAddStop}
         theme={theme}
         routePath={routePath}
+        mapStyle={animOptions.mapStyle || "satellite"}
       />
 
       {/* 3. Sleek macOS Modal Infographics Movie Preview Overlay */}
