@@ -329,6 +329,7 @@ export default function App() {
 
       // 2. Mathematically compute coordinate boundaries for tile preloading
       const rMajor = 6378137.0;
+      const circumference = 2 * Math.PI * rMajor;
       
       function toMercator(lat, lon) {
         const x = rMajor * lon * Math.PI / 180.0;
@@ -337,13 +338,39 @@ export default function App() {
       }
 
       const mercPoints = routeGeometry.map(pt => toMercator(pt[0], pt[1]));
+      const stationMercs = stops.map(s => {
+        const coords = toMercator(s.lat, s.lon);
+        return { x: coords[0], y: coords[1] };
+      });
+
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      stationMercs.forEach(s => {
+        if (s.x < minX) minX = s.x;
+        if (s.x > maxX) maxX = s.x;
+        if (s.y < minY) minY = s.y;
+        if (s.y > maxY) maxY = s.y;
+      });
+
+      const bboxW = maxX - minX;
+      const bboxH = maxY - minY;
+      const marginFactor = 1.35;
+      const canvasW = 1280;
+      const canvasH = 720;
+      const targetScaleX = canvasW / Math.max(1, bboxW * marginFactor);
+      const targetScaleY = canvasH / Math.max(1, bboxH * marginFactor);
+      let targetScale = Math.min(targetScaleX, targetScaleY);
+      const scale12 = (256 * Math.pow(2, 12)) / circumference;
+      targetScale = Math.min(scale12, targetScale);
+
+      const targetZoom = Math.max(3, Math.min(12, Math.floor(Math.log2(targetScale * circumference / 256))));
 
       // 3. Preload Map Tiles in background (takes 20% -> 100%)
       setProgressText("Downloading high-resolution preview map...");
       const tileSet = await preloadMapTiles(mercPoints, 12, theme, animOptions.mapStyle || "satellite", (text, pct) => {
         setProgressText(text);
         setProgressPct(Math.round(20 + pct * 0.8));
-      });
+      }, targetZoom);
 
       setIsGenerating(false);
       setPreviewProgress(false);
@@ -403,6 +430,28 @@ export default function App() {
     const scale = (256 * Math.pow(2, zoom)) / circumference;
     const stopDuration = animOptions.stopDuration !== undefined ? animOptions.stopDuration : 0.5;
 
+    // Calculate bounding box center and target scale to show all stops at the end
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    stationMercs.forEach(s => {
+      if (s.x < minX) minX = s.x;
+      if (s.x > maxX) maxX = s.x;
+      if (s.y < minY) minY = s.y;
+      if (s.y > maxY) maxY = s.y;
+    });
+
+    const bboxCenterX = (minX + maxX) / 2;
+    const bboxCenterY = (minY + maxY) / 2;
+    const bboxW = maxX - minX;
+    const bboxH = maxY - minY;
+
+    const marginFactor = 1.35;
+    const targetScaleX = canvasW / Math.max(1, bboxW * marginFactor);
+    const targetScaleY = canvasH / Math.max(1, bboxH * marginFactor);
+    let targetScale = Math.min(targetScaleX, targetScaleY);
+    const scale12 = (256 * Math.pow(2, zoom)) / circumference;
+    targetScale = Math.min(scale12, targetScale);
+
     // 1. Find indices of stations in mercPoints
     const stationIndices = stationMercs.map(station => {
       let closestIdx = 0;
@@ -417,19 +466,18 @@ export default function App() {
       return closestIdx;
     });
 
-    // 2. Precompute frame mapping with 60-frame intro (30s spin, 30s vehicle appearance)
+    // 2. Precompute frame mapping
+    const zoomOutFrames = Math.min(Math.round(2.5 * animOptions.fps), Math.round(totalFrames * 0.25));
     const frameToNodeIdx = new Array(totalFrames);
-    const introFrames = 60; // 30 frames for spin, 30 frames for vehicle appearance
-    const activeFrames = Math.max(0, totalFrames - introFrames);
+    const introFrames = 60;
+    const activeFrames = Math.max(0, totalFrames - introFrames - zoomOutFrames);
     const numInterStops = stationMercs.length - 2;
     const stopDurationFrames = Math.round(stopDuration * animOptions.fps);
     
-    // First 60 frames are pinned to node 0 (start station)
     for (let f = 0; f < introFrames; f++) {
       frameToNodeIdx[f] = 0;
     }
 
-    // Cap total stop duration at 50% of the active travel frames to guarantee the vehicle travels!
     const maxTotalStopFrames = Math.round(activeFrames * 0.5);
     const totalStopFrames = Math.min(numInterStops * stopDurationFrames, maxTotalStopFrames);
     const stopFramesPerStop = numInterStops > 0 ? Math.floor(totalStopFrames / numInterStops) : 0;
@@ -440,24 +488,20 @@ export default function App() {
       const startNode = stationIndices[seg];
       const endNode = stationIndices[seg + 1];
       const nodeSpan = endNode - startNode;
-
-      // Distribute travel frames proportionally to the segment length
       const segFrac = nodeSpan / mercPoints.length;
       const segTravelFrames = Math.round(segFrac * travelFrames);
 
-      // Populate travel frames
       for (let f = 0; f < segTravelFrames; f++) {
-        if (currentFrame < totalFrames) {
+        if (currentFrame < totalFrames - zoomOutFrames) {
           const ratio = f / Math.max(1, segTravelFrames - 1);
           frameToNodeIdx[currentFrame] = Math.round(startNode + ratio * nodeSpan);
           currentFrame++;
         }
       }
 
-      // Populate stop frames if it is an intermediate stop
       if (seg < stationIndices.length - 2) {
         for (let f = 0; f < stopFramesPerStop; f++) {
-          if (currentFrame < totalFrames) {
+          if (currentFrame < totalFrames - zoomOutFrames) {
             frameToNodeIdx[currentFrame] = endNode;
             currentFrame++;
           }
@@ -465,15 +509,16 @@ export default function App() {
       }
     }
 
-    // Fill any remaining frames with the last node index
-    while (currentFrame < totalFrames) {
+    while (currentFrame < totalFrames - zoomOutFrames) {
       frameToNodeIdx[currentFrame] = mercPoints.length - 1;
       currentFrame++;
     }
+    for (let f = totalFrames - zoomOutFrames; f < totalFrames; f++) {
+      frameToNodeIdx[f] = mercPoints.length - 1;
+    }
 
-    // Precompute sliding average camera path coordinates (low-pass filter)
     const camPoints = [];
-    const windowSize = 45; // 45 points before, 45 points after
+    const windowSize = 45;
     for (let i = 0; i < mercPoints.length; i++) {
       let sumX = 0;
       let sumY = 0;
@@ -488,77 +533,54 @@ export default function App() {
       camPoints.push([sumX / count, sumY / count]);
     }
 
-    // Dynamic toCanvas function that references active camera center closed over by drawing loop
     let toCanvas = () => [0, 0];
 
-    // Helper to calculate trailing points along the path for articulated preview train
     function getTrailingPoint(leadIdx, targetDist) {
       let currentDist = 0;
       let idx = leadIdx;
-      
       let [px, py] = toCanvas(mercPoints[idx][0], mercPoints[idx][1]);
       let angle = smoothedAngles[idx];
-      
       while (idx > 0 && currentDist < targetDist) {
         const nextIdx = idx - 1;
         const [npx, npy] = toCanvas(mercPoints[nextIdx][0], mercPoints[nextIdx][1]);
         const segmentDist = Math.hypot(npx - px, npy - py);
-        
         if (currentDist + segmentDist >= targetDist) {
           const ratio = (targetDist - currentDist) / segmentDist;
           const ix = px + ratio * (npx - px);
           const iy = py + ratio * (npy - py);
-          
           const angleA = smoothedAngles[idx];
           const angleB = smoothedAngles[nextIdx];
           let diff = angleB - angleA;
           while (diff < -Math.PI) diff += 2 * Math.PI;
           while (diff > Math.PI) diff -= 2 * Math.PI;
           const iAngle = angleA + ratio * diff;
-          
           return { x: ix, y: iy, angle: iAngle, emerged: true };
         }
-        
         currentDist += segmentDist;
         px = npx;
         py = npy;
         idx = nextIdx;
       }
-      
       const fallX = px - Math.cos(angle) * (targetDist - currentDist);
       const fallY = py - Math.sin(angle) * (targetDist - currentDist);
       return { x: fallX, y: fallY, angle, emerged: false };
     }
 
-    // 1. Mathematically precompute smoothed vector heading angles for preview vehicle (with EMA filter)
     const smoothedAngles = [];
     if (mercPoints.length > 0) {
-      let prevX = 0;
-      let prevY = 0;
-      let initialized = false;
-      const alpha = 0.15; // Smooth exponential filter
-
+      let prevX = 0, prevY = 0, initialized = false;
+      const alpha = 0.15;
       for (let i = 0; i < mercPoints.length; i++) {
         let nextIdx = Math.min(i + 5, mercPoints.length - 1);
-        if (nextIdx === i) nextIdx = Math.min(i + 1, mercPoints.length - 1);
         let prevIdx = Math.max(i - 5, 0);
-        if (prevIdx === i) prevIdx = Math.max(i - 1, 0);
-
-        const pCurr = mercPoints[prevIdx];
-        const pNext = mercPoints[nextIdx];
-
+        const pCurr = mercPoints[prevIdx], pNext = mercPoints[nextIdx];
         let rawAngle = 0;
         if (pNext[0] !== pCurr[0] || pNext[1] !== pCurr[1]) {
           rawAngle = Math.atan2(pNext[1] - pCurr[1], pNext[0] - pCurr[0]);
-        } else if (i > 0) {
-          rawAngle = smoothedAngles[i - 1];
-        }
-
+        } else if (i > 0) rawAngle = smoothedAngles[i - 1];
         if (!initialized) {
-          prevX = Math.cos(rawAngle);
-          prevY = Math.sin(rawAngle);
-          initialized = true;
-          smoothedAngles.push(rawAngle);
+          prevX = Math.cos(rawAngle); prevY = Math.sin(rawAngle);
+          initialized = true; smoothedAngles.push(rawAngle);
         } else {
           prevX = alpha * Math.cos(rawAngle) + (1 - alpha) * prevX;
           prevY = alpha * Math.sin(rawAngle) + (1 - alpha) * prevY;
@@ -567,95 +589,76 @@ export default function App() {
       }
     }
 
-    // 2. Precompute Smart GIS Label Offsets to place labels on the outside of bends
     stationMercs.forEach((station) => {
-      let closestIdx = 0;
-      let closestDist = Infinity;
-      
+      let closestIdx = 0, closestDist = Infinity;
       for (let i = 0; i < mercPoints.length; i++) {
         const dist = Math.hypot(mercPoints[i][0] - station.x, mercPoints[i][1] - station.y);
-        if (dist < closestDist) {
-          closestDist = dist;
-          closestIdx = i;
-        }
+        if (dist < closestDist) { closestDist = dist; closestIdx = i; }
       }
-
-      const leftIdx = Math.max(0, closestIdx - 6);
-      const rightIdx = Math.min(mercPoints.length - 1, closestIdx + 6);
-      const pLeft = mercPoints[leftIdx];
-      const pRight = mercPoints[rightIdx];
-
-      let segmentAngle = 0;
-      let crossProduct = 0;
-
+      const leftIdx = Math.max(0, closestIdx - 6), rightIdx = Math.min(mercPoints.length - 1, closestIdx + 6);
+      const pLeft = mercPoints[leftIdx], pRight = mercPoints[rightIdx];
+      let segmentAngle = 0, crossProduct = 0;
       if (pRight && pLeft && (pRight[0] !== pLeft[0] || pRight[1] !== pLeft[1])) {
         segmentAngle = Math.atan2(pRight[1] - pLeft[1], pRight[0] - pLeft[0]);
-        
         const pMid = mercPoints[closestIdx];
-        const dx1 = pMid[0] - pLeft[0];
-        const dy1 = pMid[1] - pLeft[1];
-        const dx2 = pRight[0] - pMid[0];
-        const dy2 = pRight[1] - pMid[1];
-        crossProduct = dx1 * dy2 - dy1 * dx2;
+        crossProduct = (pMid[0] - pLeft[0]) * (pRight[1] - pMid[1]) - (pMid[1] - pLeft[1]) * (pRight[0] - pMid[0]);
       }
-
       let offsetAngle = segmentAngle + Math.PI / 2;
-      if (crossProduct > 0) {
-        offsetAngle = segmentAngle - Math.PI / 2; // Flip to right side (outside of curve)
-      }
-
+      if (crossProduct > 0) offsetAngle = segmentAngle - Math.PI / 2;
       station.lxOffset = Math.cos(offsetAngle);
       station.lyOffset = Math.sin(offsetAngle);
     });
 
     let frame = 0;
-    
     const draw = () => {
       ctx.clearRect(0, 0, canvasW, canvasH);
-
       const activeIdx = frameToNodeIdx[Math.min(frame, totalFrames - 1)];
       const activeCount = Math.max(1, activeIdx + 1);
       const leadIdx = Math.min(activeIdx, mercPoints.length - 1);
-      
-      // Update camera center at vehicle lead point
-      const [camX, camY] = camPoints[leadIdx];
+      let currentCamX, currentCamY, currentScale;
+      const zoom12 = 12;
+      const scale12 = (256 * Math.pow(2, zoom12)) / circumference;
 
-      // Re-assign mapping function for the current camera coordinates
+      if (frame < totalFrames - zoomOutFrames) {
+        [currentCamX, currentCamY] = camPoints[leadIdx];
+        currentScale = scale12;
+      } else {
+        const t = Math.min(1, Math.max(0, (frame - (totalFrames - zoomOutFrames)) / zoomOutFrames));
+        const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        const lastCamX = camPoints[mercPoints.length - 1][0];
+        const lastCamY = camPoints[mercPoints.length - 1][1];
+        currentCamX = lastCamX + (bboxCenterX - lastCamX) * ease;
+        currentCamY = lastCamY + (bboxCenterY - lastCamY) * ease;
+        const targetZoomFloat = Math.log2(targetScale * circumference / 256);
+        const currentZoom = zoom12 + (targetZoomFloat - zoom12) * ease;
+        currentScale = (256 * Math.pow(2, currentZoom)) / circumference;
+      }
+
       toCanvas = (mx, my) => {
-        const px = 640 + (mx - camX) * scale;
-        const py = 360 - (my - camY) * scale;
+        const px = 640 + (mx - currentCamX) * currentScale;
+        const py = 360 - (my - currentCamY) * currentScale;
         return [px, py];
       };
 
-      // Render Preview high-resolution Map Background (Satellite base tiles)
       if (tileSet) {
-        function tileXYToMercatorBounds(tx, ty, zoom) {
+        function tileXYToMercatorBounds(tx, ty, z) {
           const halfC = circumference / 2;
-          const numTiles = Math.pow(2, zoom);
-          const minX = (tx / numTiles) * circumference - halfC;
-          const maxX = ((tx + 1) / numTiles) * circumference - halfC;
-          const maxY = halfC - (ty / numTiles) * circumference;
-          const minY = halfC - ((ty + 1) / numTiles) * circumference;
-          return { minX, maxX, minY, maxY };
+          const numTiles = Math.pow(2, z);
+          return { minX: (tx / numTiles) * circumference - halfC, maxX: ((tx + 1) / numTiles) * circumference - halfC, maxY: halfC - (ty / numTiles) * circumference, minY: halfC - ((ty + 1) / numTiles) * circumference };
         }
-
-        const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
-        const cx = Math.floor(ctxFrac);
-        const cy = Math.floor(ctyFrac);
-
-        // Draw solid background color fallback to avoid visual glitches
+        const currentZoomFloat = Math.log2(currentScale * circumference / 256);
+        const drawZoom = Math.max(3, Math.min(12, Math.floor(currentZoomFloat)));
+        const [ctxFrac, ctyFrac] = mercatorToTileXY(currentCamX, currentCamY, drawZoom);
+        const cx = Math.floor(ctxFrac), cy = Math.floor(ctyFrac);
         ctx.fillStyle = theme === "dark" ? "#151516" : (animOptions.mapStyle === "satellite" ? "#2b3d28" : "#f4f3f0");
         ctx.fillRect(0, 0, canvasW, canvasH);
-
-        // 1. Draw base tiles in 9x7 viewport grid
         for (let dx = -4; dx <= 4; dx++) {
           for (let dy = -3; dy <= 3; dy++) {
-            const tx = cx + dx;
-            const ty = cy + dy;
-            const key = `${zoom}_${tx}_${ty}`;
+            const tx = cx + dx, ty = cy + dy;
+            const key = `${drawZoom}_${tx}_${ty}`;
             const img = tileSet.cacheSat[key];
             if (img) {
-              const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+              const bounds = tileXYToMercatorBounds(tx, ty, drawZoom);
               const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
               const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
               ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
@@ -663,8 +666,6 @@ export default function App() {
           }
         }
       } else {
-        ctx.fillStyle = theme === "dark" ? "#151516" : "#e8e4d8"; // Land color fallback
-        ctx.fillRect(0, 0, canvasW, canvasH);
       }
 
       // Inactive outline path
@@ -954,7 +955,10 @@ export default function App() {
           return { minX, maxX, minY, maxY };
         }
 
-        const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
+        const currentZoomFloat = Math.log2(currentScale * circumference / 256);
+        const drawZoom = Math.max(3, Math.min(12, Math.floor(currentZoomFloat)));
+
+        const [ctxFrac, ctyFrac] = mercatorToTileXY(currentCamX, currentCamY, drawZoom);
         const cx = Math.floor(ctxFrac);
         const cy = Math.floor(ctyFrac);
 
@@ -962,10 +966,10 @@ export default function App() {
           for (let dy = -3; dy <= 3; dy++) {
             const tx = cx + dx;
             const ty = cy + dy;
-            const key = `${zoom}_${tx}_${ty}`;
+            const key = `${drawZoom}_${tx}_${ty}`;
             const img = tileSet.cacheRef[key];
             if (img) {
-              const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+              const bounds = tileXYToMercatorBounds(tx, ty, drawZoom);
               const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
               const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
               ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);

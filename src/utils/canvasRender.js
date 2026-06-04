@@ -26,7 +26,7 @@ function mercatorToTileXY(mx, my, zoom) {
   return [xFrac * Math.pow(2, zoom), yFrac * Math.pow(2, zoom)];
 }
 
-export async function preloadMapTiles(mercPoints, zoom, theme, mapStyle = "satellite", onProgress) {
+export async function preloadMapTiles(mercPoints, zoom, theme, mapStyle = "satellite", onProgress, targetZoom = null) {
   // If third argument is a function, then the caller used the old signature: (mercPoints, zoom, theme, onProgress)
   // Let's handle backward compatibility robustly!
   let actualMapStyle = mapStyle;
@@ -38,19 +38,25 @@ export async function preloadMapTiles(mercPoints, zoom, theme, mapStyle = "satel
 
   const uniqueTiles = new Set();
   
-  // Find all tiles touched by the path at the zoom level
-  mercPoints.forEach(pt => {
-    const [tx, ty] = mercatorToTileXY(pt[0], pt[1], zoom);
-    const fX = Math.floor(tx);
-    const fY = Math.floor(ty);
-    
-    // Add a 3x3 grid of tiles around each point along the path
-    for (let dx = -2; dx <= 2; dx++) {
-      for (let dy = -2; dy <= 2; dy++) {
-        uniqueTiles.add(`${zoom}_${fX + dx}_${fY + dy}`);
+  const minZoom = targetZoom !== null ? Math.min(zoom, targetZoom) : zoom;
+  const maxZoom = targetZoom !== null ? Math.max(zoom, targetZoom) : zoom;
+
+  for (let z = minZoom; z <= maxZoom; z++) {
+    mercPoints.forEach(pt => {
+      const [tx, ty] = mercatorToTileXY(pt[0], pt[1], z);
+      const fX = Math.floor(tx);
+      const fY = Math.floor(ty);
+      
+      // Use 3x3 radius (radius = 1) for lower zoom levels to minimize network traffic
+      // and 5x5 (radius = 2) for high zoom levels to ensure complete screen coverage
+      const radius = z >= 11 ? 2 : 1;
+      for (let dx = -radius; dx <= radius; dx++) {
+        for (let dy = -radius; dy <= radius; dy++) {
+          uniqueTiles.add(`${z}_${fX + dx}_${fY + dy}`);
+        }
       }
-    }
-  });
+    });
+  }
 
   const tilesToLoad = Array.from(uniqueTiles).map(key => {
     const [z, x, y] = key.split("_").map(Number);
@@ -367,6 +373,30 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   const zoom = 12;
   const scale = (256 * Math.pow(2, zoom)) / CIRCUMFERENCE;
 
+  // Calculate bounding box center and target scale to show all stops at the end
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  stationMercs.forEach(s => {
+    if (s.x < minX) minX = s.x;
+    if (s.x > maxX) maxX = s.x;
+    if (s.y < minY) minY = s.y;
+    if (s.y > maxY) maxY = s.y;
+  });
+
+  const bboxCenterX = (minX + maxX) / 2;
+  const bboxCenterY = (minY + maxY) / 2;
+  const bboxW = maxX - minX;
+  const bboxH = maxY - minY;
+
+  const marginFactor = 1.35;
+  const targetScaleX = canvas.width / Math.max(1, bboxW * marginFactor);
+  const targetScaleY = canvas.height / Math.max(1, bboxH * marginFactor);
+  let targetScale = Math.min(targetScaleX, targetScaleY);
+  const scale12 = (256 * Math.pow(2, zoom)) / CIRCUMFERENCE;
+  targetScale = Math.min(scale12, targetScale);
+
+  const targetZoom = Math.max(3, Math.min(12, Math.floor(Math.log2(targetScale * CIRCUMFERENCE / 256))));
+
   // 1. Find indices of stations in mercPoints
   const stationIndices = stationMercs.map(station => {
     let closestIdx = 0;
@@ -382,9 +412,11 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   });
 
   // 2. Precompute frame mapping with 60-frame intro (30s spin, 30s vehicle appearance)
+  // and zoom out frames at the end
+  const zoomOutFrames = Math.min(Math.round(2.5 * fps), Math.round(totalFrames * 0.25));
   const frameToNodeIdx = new Array(totalFrames);
   const introFrames = 60; // 30 frames for spin, 30 frames for vehicle appearance
-  const activeFrames = Math.max(0, totalFrames - introFrames);
+  const activeFrames = Math.max(0, totalFrames - introFrames - zoomOutFrames);
   const numInterStops = stationMercs.length - 2;
   const stopDurationFrames = Math.round(stopDuration * fps);
   
@@ -455,7 +487,7 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
   onProgress("Initializing map assets...", 10);
   const tileSet = await preloadMapTiles(mercPoints, zoom, theme, mapStyle, (text, pct) => {
     onProgress(text, Math.round(10 + pct * 0.25));
-  });
+  }, targetZoom);
 
   const labelFontFamily = language === "hindi" 
     ? "'Kohinoor Devanagari', 'ITF Devanagari', sans-serif" 
@@ -553,16 +585,40 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
     const activeIdx = frameToNodeIdx[Math.min(frameIdx, totalFrames - 1)];
     const activeCount = Math.max(1, activeIdx + 1);
     const leadIdx = Math.min(activeIdx, mercPoints.length - 1);
-    const [camX, camY] = camPoints[leadIdx];
+    
+    let currentCamX, currentCamY, currentScale;
+    
+    if (frameIdx < totalFrames - zoomOutFrames) {
+      [currentCamX, currentCamY] = camPoints[leadIdx];
+      currentScale = scale12;
+    } else {
+      const t = Math.min(1, Math.max(0, (frameIdx - (totalFrames - zoomOutFrames)) / zoomOutFrames));
+      const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+      
+      const lastCamX = camPoints[mercPoints.length - 1][0];
+      const lastCamY = camPoints[mercPoints.length - 1][1];
+      
+      currentCamX = lastCamX + (bboxCenterX - lastCamX) * ease;
+      currentCamY = lastCamY + (bboxCenterY - lastCamY) * ease;
+      
+      // Logarithmic zoom interpolation
+      const zoom12 = 12;
+      const targetZoomFloat = Math.log2(targetScale * CIRCUMFERENCE / 256);
+      const currentZoom = zoom12 + (targetZoomFloat - zoom12) * ease;
+      currentScale = (256 * Math.pow(2, currentZoom)) / CIRCUMFERENCE;
+    }
 
     const toCanvas = (mx, my) => {
-      const px = 1440 + (mx - camX) * scale;
-      const py = 810 - (my - camY) * scale;
+      const px = 1440 + (mx - currentCamX) * currentScale;
+      const py = 810 - (my - currentCamY) * currentScale;
       return [px, py];
     };
 
     // Calculate map tile indices covering the camera focus
-    const [ctxFrac, ctyFrac] = mercatorToTileXY(camX, camY, zoom);
+    const currentZoomFloat = Math.log2(currentScale * CIRCUMFERENCE / 256);
+    const drawZoom = Math.max(3, Math.min(12, Math.floor(currentZoomFloat)));
+
+    const [ctxFrac, ctyFrac] = mercatorToTileXY(currentCamX, currentCamY, drawZoom);
     const cx = Math.floor(ctxFrac);
     const cy = Math.floor(ctyFrac);
 
@@ -571,10 +627,10 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
       for (let dy = -4; dy <= 4; dy++) {
         const tx = cx + dx;
         const ty = cy + dy;
-        const key = `${zoom}_${tx}_${ty}`;
+        const key = `${drawZoom}_${tx}_${ty}`;
         const img = tileSet.cacheSat[key];
         if (img) {
-          const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+          const bounds = tileXYToMercatorBounds(tx, ty, drawZoom);
           const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
           const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
           ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
@@ -725,10 +781,10 @@ export async function renderAndRecordAnimation({ routeGeometry, stations, option
       for (let dy = -4; dy <= 4; dy++) {
         const tx = cx + dx;
         const ty = cy + dy;
-        const key = `${zoom}_${tx}_${ty}`;
+        const key = `${drawZoom}_${tx}_${ty}`;
         const img = tileSet.cacheRef[key];
         if (img) {
-          const bounds = tileXYToMercatorBounds(tx, ty, zoom);
+          const bounds = tileXYToMercatorBounds(tx, ty, drawZoom);
           const [px1, py1] = toCanvas(bounds.minX, bounds.maxY);
           const [px2, py2] = toCanvas(bounds.maxX, bounds.minY);
           ctx.drawImage(img, px1, py1, px2 - px1 + 1, py2 - py1 + 1);
