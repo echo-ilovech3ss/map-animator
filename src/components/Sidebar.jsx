@@ -381,6 +381,26 @@ export default function Sidebar({
                   />
                   <span style={{ fontSize: "12.5px" }}>60 FPS (Fluid)</span>
                 </div>
+
+                <div className="checkbox-row" onClick={() => onChangeOptions("startZoomedOut", animOptions.startZoomedOut !== false ? false : true)}>
+                  <input
+                    type="checkbox"
+                    className="macos-checkbox"
+                    checked={animOptions.startZoomedOut !== false}
+                    readOnly
+                  />
+                  <span style={{ fontSize: "12.5px" }}>Standard, at zoomout level</span>
+                </div>
+
+                <div className="checkbox-row" onClick={() => onChangeOptions("zoomInStart", animOptions.zoomInStart !== false ? false : true)}>
+                  <input
+                    type="checkbox"
+                    className="macos-checkbox"
+                    checked={animOptions.zoomInStart !== false}
+                    readOnly
+                  />
+                  <span style={{ fontSize: "12.5px" }}>Zoom in at start</span>
+                </div>
               </div>
             </div>
 

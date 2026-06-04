@@ -28,6 +28,8 @@ export default function App() {
       if (parsed.showVehicle === undefined) parsed.showVehicle = true;
       if (parsed.stopDuration === undefined) parsed.stopDuration = 0.5;
       if (parsed.mapStyle === undefined) parsed.mapStyle = "satellite";
+      if (parsed.startZoomedOut === undefined) parsed.startZoomedOut = true;
+      if (parsed.zoomInStart === undefined) parsed.zoomInStart = true;
       return parsed;
     }
     return {
@@ -39,6 +41,8 @@ export default function App() {
       autoDuration: true,
       stopDuration: 0.5,
       mapStyle: "satellite",
+      startZoomedOut: true,
+      zoomInStart: true,
       exportName: "",
       exportDirectory: ""
     };
@@ -467,7 +471,11 @@ export default function App() {
     });
 
     // 2. Precompute frame mapping
-    const zoomOutFrames = Math.min(Math.round(2.5 * animOptions.fps), Math.round(totalFrames * 0.25));
+    const startZoomedOut = animOptions.startZoomedOut !== false;
+    const zoomInStart = animOptions.zoomInStart !== false;
+    const hasZoomOutEnd = startZoomedOut && zoomInStart;
+
+    const zoomOutFrames = hasZoomOutEnd ? Math.min(Math.round(2.5 * animOptions.fps), Math.round(totalFrames * 0.25)) : 0;
     const frameToNodeIdx = new Array(totalFrames);
     const introFrames = 60;
     const activeFrames = Math.max(0, totalFrames - introFrames - zoomOutFrames);
@@ -619,19 +627,54 @@ export default function App() {
       const zoom12 = 12;
       const scale12 = (256 * Math.pow(2, zoom12)) / circumference;
 
-      if (frame < totalFrames - zoomOutFrames) {
+      if (startZoomedOut && !zoomInStart) {
+        currentCamX = bboxCenterX;
+        currentCamY = bboxCenterY;
+        currentScale = targetScale;
+      } else if (!startZoomedOut && !zoomInStart) {
         [currentCamX, currentCamY] = camPoints[leadIdx];
         currentScale = scale12;
+      } else if (!startZoomedOut && zoomInStart) {
+        if (frame < introFrames) {
+          const t = Math.min(1, Math.max(0, frame / introFrames));
+          const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+          const firstCamX = camPoints[0][0];
+          const firstCamY = camPoints[0][1];
+          currentCamX = bboxCenterX + (firstCamX - bboxCenterX) * ease;
+          currentCamY = bboxCenterY + (firstCamY - bboxCenterY) * ease;
+          const targetZoomFloat = Math.log2(targetScale * circumference / 256);
+          const currentZoom = targetZoomFloat + (zoom12 - targetZoomFloat) * ease;
+          currentScale = (256 * Math.pow(2, currentZoom)) / circumference;
+        } else {
+          [currentCamX, currentCamY] = camPoints[leadIdx];
+          currentScale = scale12;
+        }
       } else {
-        const t = Math.min(1, Math.max(0, (frame - (totalFrames - zoomOutFrames)) / zoomOutFrames));
-        const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-        const lastCamX = camPoints[mercPoints.length - 1][0];
-        const lastCamY = camPoints[mercPoints.length - 1][1];
-        currentCamX = lastCamX + (bboxCenterX - lastCamX) * ease;
-        currentCamY = lastCamY + (bboxCenterY - lastCamY) * ease;
-        const targetZoomFloat = Math.log2(targetScale * circumference / 256);
-        const currentZoom = zoom12 + (targetZoomFloat - zoom12) * ease;
-        currentScale = (256 * Math.pow(2, currentZoom)) / circumference;
+        // Both checked
+        if (frame < introFrames) {
+          const t = Math.min(1, Math.max(0, frame / introFrames));
+          const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+          const firstCamX = camPoints[0][0];
+          const firstCamY = camPoints[0][1];
+          currentCamX = bboxCenterX + (firstCamX - bboxCenterX) * ease;
+          currentCamY = bboxCenterY + (firstCamY - bboxCenterY) * ease;
+          const targetZoomFloat = Math.log2(targetScale * circumference / 256);
+          const currentZoom = targetZoomFloat + (zoom12 - targetZoomFloat) * ease;
+          currentScale = (256 * Math.pow(2, currentZoom)) / circumference;
+        } else if (frame < totalFrames - zoomOutFrames) {
+          [currentCamX, currentCamY] = camPoints[leadIdx];
+          currentScale = scale12;
+        } else {
+          const t = Math.min(1, Math.max(0, (frame - (totalFrames - zoomOutFrames)) / zoomOutFrames));
+          const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+          const lastCamX = camPoints[mercPoints.length - 1][0];
+          const lastCamY = camPoints[mercPoints.length - 1][1];
+          currentCamX = lastCamX + (bboxCenterX - lastCamX) * ease;
+          currentCamY = lastCamY + (bboxCenterY - lastCamY) * ease;
+          const targetZoomFloat = Math.log2(targetScale * circumference / 256);
+          const currentZoom = zoom12 + (targetZoomFloat - zoom12) * ease;
+          currentScale = (256 * Math.pow(2, currentZoom)) / circumference;
+        }
       }
 
       toCanvas = (mx, my) => {
